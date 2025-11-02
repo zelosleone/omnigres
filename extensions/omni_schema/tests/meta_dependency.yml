@@ -94,3 +94,12 @@ tests:
       and omni_types.variant(id) = 'omni_schema.language_id'::regtype
   results:
   - result: true
+
+- name: operators have correct type namespaces
+  query: |
+    select count(*) as operator_count
+    from omni_schema.dependency 
+    where omni_types.variant(id) = 'omni_schema.operator_id'::regtype
+      and id::text = 'operator_id((omni_schema,=,omni_schema,object_id,omni_schema,object_id))'
+  results:
+  - operator_count: 8
