@@ -26,6 +26,9 @@
 #include "h2o/socketpool.h"
 #include "h2o/balancer.h"
 #include "h2o/http3_server.h"
+#if H2O_USE_FUSION
+#include "picotls/fusion.h"
+#endif
 
 struct rp_handler_t {
     h2o_handler_t super;
@@ -63,7 +66,7 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
     return 0;
 }
 
-static h2o_http3client_ctx_t *create_http3_context(h2o_context_t *ctx, int use_gso)
+static h2o_http3client_ctx_t *create_http3_context(h2o_context_t *ctx, SSL_CTX *ssl_ctx, int use_gso)
 {
 #if H2O_USE_LIBUV
     h2o_fatal("no HTTP/3 support for libuv");
@@ -71,13 +74,21 @@ static h2o_http3client_ctx_t *create_http3_context(h2o_context_t *ctx, int use_g
 
     h2o_http3client_ctx_t *h3ctx = h2o_mem_alloc(sizeof(*h3ctx));
 
-    /* tls (FIXME provide knobs to configure, incl. certificate validation) */
+    /* tls (TODO inherit session cache setting of ssl_ctx) */
     h3ctx->tls = (ptls_context_t){
         .random_bytes = ptls_openssl_random_bytes,
         .get_time = &ptls_get_time,
         .key_exchanges = ptls_openssl_key_exchanges,
         .cipher_suites = ptls_openssl_cipher_suites,
     };
+    h3ctx->verify_cert = (ptls_openssl_verify_certificate_t){};
+    if ((SSL_CTX_get_verify_mode(ssl_ctx) & SSL_VERIFY_PEER) != 0) {
+        X509_STORE *store;
+        if ((store = SSL_CTX_get_cert_store(ssl_ctx)) == NULL)
+            h2o_fatal("failed to obtain the store to be used for server certificate verification");
+        ptls_openssl_init_verify_certificate(&h3ctx->verify_cert, store);
+        h3ctx->tls.verify_certificate = &h3ctx->verify_cert.super;
+    }
     quicly_amend_ptls_context(&h3ctx->tls);
 
     /* quic */
@@ -86,8 +97,12 @@ static h2o_http3client_ctx_t *create_http3_context(h2o_context_t *ctx, int use_g
     h3ctx->quic.transport_params.max_streams_uni = 10;
     uint8_t cid_key[PTLS_SHA256_DIGEST_SIZE];
     ptls_openssl_random_bytes(cid_key, sizeof(cid_key));
-    h3ctx->quic.cid_encryptor = quicly_new_default_cid_encryptor(&ptls_openssl_bfecb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
-                                                                 ptls_iovec_init(cid_key, sizeof(cid_key)));
+    h3ctx->quic.cid_encryptor = quicly_new_default_cid_encryptor(
+#if H2O_USE_FUSION
+        ptls_fusion_is_supported_by_cpu() ? &ptls_fusion_quiclb :
+#endif
+                                          &ptls_openssl_quiclb,
+        &ptls_openssl_aes128ecb, &ptls_openssl_sha256, ptls_iovec_init(cid_key, sizeof(cid_key)));
     ptls_clear_memory(cid_key, sizeof(cid_key));
     h3ctx->quic.stream_open = &h2o_httpclient_http3_on_stream_open;
 
@@ -120,6 +135,8 @@ static void destroy_http3_context(h2o_http3client_ctx_t *h3ctx)
 {
     h2o_quic_dispose_context(&h3ctx->h3);
     quicly_free_default_cid_encryptor(h3ctx->quic.cid_encryptor);
+    if (h3ctx->verify_cert.super.cb != NULL)
+        ptls_openssl_dispose_verify_certificate(&h3ctx->verify_cert);
     free(h3ctx);
 }
 
@@ -162,7 +179,9 @@ static void on_context_init(h2o_handler_t *_self, h2o_context_t *ctx)
                 .latency_optimization = ctx->globalconf->http2.latency_optimization, /* TODO provide config knob, or disable? */
                 .max_concurrent_streams = self->config.http2.max_concurrent_streams,
             },
-        .http3 = self->config.protocol_ratio.http3 != 0 ? create_http3_context(ctx, ctx->globalconf->http3.use_gso) : NULL,
+        .http3 = self->config.protocol_ratio.http3 != 0
+                     ? create_http3_context(ctx, self->sockpool->_ssl_ctx, ctx->globalconf->http3.use_gso)
+                     : NULL,
     };
 
     handler_ctx->client_ctx = client_ctx;

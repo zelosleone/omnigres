@@ -295,4 +295,13 @@ tests:
   - http_version: 2
 
 - name: protocol selector (H3)
-  todo: pending working H3 support in omni_httpd
+  # Using external host for the time being (FIXME, pending H3 support in omni_httpd)
+  query: |
+    with response as (select *
+                      from omni_httpc.http_execute_with_options(
+                              omni_httpc.http_execute_options(http3_ratio => 100),
+                              omni_httpc.http_request('https://example.com')))
+    select response.version >> 8 as http_version
+    from response
+  results:
+  - http_version: 3
