@@ -33,15 +33,14 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
-#include <openssl/provider.h>
-#define LOAD_OPENSSL_PROVIDER 1
-#endif
 #include "h2o/hiredis_.h"
 #include "yoml-parser.h"
 #include "yrmcds.h"
 #include "picotls.h"
 #include "picotls/openssl.h"
+#if H2O_USE_FUSION
+#include "picotls/fusion.h"
+#endif
 #include "quicly.h"
 #include "quicly/defaults.h"
 #include "h2o/file.h"
@@ -1188,12 +1187,6 @@ void init_openssl(void)
     ERR_load_ASYNC_strings();
 #endif
 
-    /* When using OpenSSL >= 3.0, load legacy provider so that blowfish can be used for 64-bit QUIC CIDs. */
-#if LOAD_OPENSSL_PROVIDER
-    OSSL_PROVIDER_load(NULL, "legacy");
-    OSSL_PROVIDER_load(NULL, "default");
-#endif
-
     cache_init_defaults();
 #if H2O_USE_SESSION_TICKETS
     ticket_init_defaults();
@@ -1225,9 +1218,19 @@ static void init_quic_keyset(struct st_quic_keyset_t *keyset, uint8_t name, ptls
         master_secret = ptls_iovec_init(master_digestbuf, PTLS_SHA256_DIGEST_SIZE);
     }
 
+    ptls_cipher_algorithm_t *cid_cipher;
+    if (quic_is_clustered) {
+        cid_cipher = &ptls_openssl_aes128ecb;
+    } else {
+        cid_cipher = &ptls_openssl_quiclb;
+#if H2O_USE_FUSION
+        if (ptls_fusion_is_supported_by_cpu())
+            cid_cipher = &ptls_fusion_quiclb;
+#endif
+    }
+
     keyset->name = name;
-    keyset->cid = quicly_new_default_cid_encryptor(quic_is_clustered ? &ptls_openssl_aes128ecb : &ptls_openssl_bfecb,
-                                                   &ptls_openssl_aes128ecb, &ptls_openssl_sha256, master_secret);
+    keyset->cid = quicly_new_default_cid_encryptor(cid_cipher, &ptls_openssl_aes128ecb, &ptls_openssl_sha256, master_secret);
     assert(keyset->cid != NULL);
     ret = ptls_hkdf_expand_label(&ptls_openssl_sha256, keybuf, PTLS_SHA256_DIGEST_SIZE, master_secret, "address-token",
                                  ptls_iovec_init(NULL, 0), "");
@@ -1340,7 +1343,7 @@ static int generate_stateless_reset_token(quicly_cid_encryptor_t *self, void *to
 
 quicly_cid_encryptor_t quic_cid_encryptor = {encrypt_cid, decrypt_cid, generate_stateless_reset_token};
 
-int quic_decrypt_address_token(quicly_address_token_plaintext_t *pt, ptls_iovec_t input, const char **err_desc)
+quicly_error_t quic_decrypt_address_token(quicly_address_token_plaintext_t *pt, ptls_iovec_t input, const char **err_desc)
 {
     struct st_quic_keyset_t *keyset;
 
@@ -1358,8 +1361,8 @@ ptls_aead_context_t *quic_get_address_token_encryptor(uint8_t *prefix)
     return keyset->address_token.enc;
 }
 
-static int generate_resumption_token(quicly_generate_resumption_token_t *self, quicly_conn_t *conn, ptls_buffer_t *buf,
-                                     quicly_address_token_plaintext_t *token)
+static quicly_error_t generate_resumption_token(quicly_generate_resumption_token_t *self, quicly_conn_t *conn, ptls_buffer_t *buf,
+                                                quicly_address_token_plaintext_t *token)
 {
     uint8_t prefix;
     ptls_aead_context_t *aead = quic_get_address_token_encryptor(&prefix);

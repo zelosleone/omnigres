@@ -29,6 +29,9 @@
 #include <openssl/provider.h>
 #endif
 
+#include "picotls.h"
+#include "picotls/openssl.h"
+
 #include <utils/syscache.h>
 
 #include "libpgaug.h"
@@ -48,6 +51,7 @@ CACHED_OID(http_response);
 static h2o_httpclient_ctx_t ctx;
 static h2o_multithread_queue_t *queue;
 static h2o_multithread_receiver_t getaddr_receiver;
+static quicly_cid_plaintext_t h3_next_cid;
 
 static h2o_httpclient_connection_pool_t *connpool;
 static h2o_socketpool_t *sockpool;
@@ -77,8 +81,8 @@ static int save_http3_ticket_cb(ptls_save_ticket_t *self, ptls_t *tls, ptls_iove
 
 static ptls_save_ticket_t save_http3_ticket = {save_http3_ticket_cb};
 
-static int save_http3_token_cb(quicly_save_resumption_token_t *self, quicly_conn_t *conn,
-                               ptls_iovec_t token) {
+static quicly_error_t save_http3_token_cb(quicly_save_resumption_token_t *self, quicly_conn_t *conn,
+                                          ptls_iovec_t token) {
   free(http3_session.token.base);
   http3_session.token = ptls_iovec_init(h2o_mem_alloc(token.len), token.len);
   memcpy(http3_session.token.base, token.base, token.len);
@@ -115,16 +119,14 @@ static void init() {
     &ptls_openssl_secp256r1,
     NULL
   };
-  static h2o_http3client_ctx_t h3ctx = {
-      .tls =
-          {
-              .random_bytes = ptls_openssl_random_bytes,
-              .get_time = &ptls_get_time,
-              .key_exchanges = h3_key_exchanges,
-              .cipher_suites = ptls_openssl_cipher_suites,
-              .save_ticket = &save_http3_ticket,
-          },
-  };
+  static h2o_http3client_ctx_t h3ctx = {.max_frame_payload_size = 16384,
+                                        .tls = {
+                                            .random_bytes = ptls_openssl_random_bytes,
+                                            .get_time = &ptls_get_time,
+                                            .key_exchanges = h3_key_exchanges,
+                                            .cipher_suites = ptls_openssl_cipher_suites,
+                                            .save_ticket = &save_http3_ticket,
+                                        }};
 
   ctx = (h2o_httpclient_ctx_t){
       .getaddr_receiver = &getaddr_receiver,
@@ -159,7 +161,7 @@ static void init() {
     uint8_t random_key[PTLS_SHA256_DIGEST_SIZE];
     h3ctx.tls.random_bytes(random_key, sizeof(random_key));
     h3ctx.quic.cid_encryptor = quicly_new_default_cid_encryptor(
-        &ptls_openssl_bfecb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+        &ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
         ptls_iovec_init(random_key, sizeof(random_key)));
     assert(h3ctx.quic.cid_encryptor != NULL);
     ptls_clear_memory(random_key, sizeof(random_key));
@@ -176,11 +178,12 @@ static void init() {
       ereport(ERROR, errmsg("failed to create UDP socket"));
     }
     memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
     if (bind(fd, (void *)&sin, sizeof(sin)) != 0) {
       ereport(ERROR, errmsg("failed to bind bind UDP socket"));
     }
     h2o_socket_t *sock = h2o_evloop_socket_create(ctx.loop, fd, H2O_SOCKET_FLAG_DONT_READ);
-    h2o_quic_init_context(&h3ctx.h3, ctx.loop, sock, &h3ctx.quic, NULL, NULL,
+    h2o_quic_init_context(&h3ctx.h3, ctx.loop, sock, &h3ctx.quic, &h3_next_cid, NULL,
                           h2o_httpclient_http3_notify_connection_update, 1, NULL);
   }
 
