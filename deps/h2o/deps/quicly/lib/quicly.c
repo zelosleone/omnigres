@@ -42,7 +42,6 @@
 #if QUICLY_USE_DTRACE
 #include "quicly-probes.h"
 #endif
-#include "quicly/retire_cid.h"
 
 #define QUICLY_TLS_EXTENSION_TYPE_TRANSPORT_PARAMETERS_FINAL 0x39
 #define QUICLY_TLS_EXTENSION_TYPE_TRANSPORT_PARAMETERS_DRAFT 0xffa5
@@ -310,7 +309,7 @@ struct st_quicly_conn_t {
          * valid if state is CLOSING
          */
         struct {
-            uint16_t error_code;
+            uint64_t error_code;
             uint64_t frame_type; /* UINT64_MAX if application close */
             const char *reason_phrase;
             unsigned long num_packets_received;
@@ -414,10 +413,6 @@ struct st_quicly_conn_t {
          */
         uint8_t try_jumpstart : 1;
         /**
-         * pending RETIRE_CONNECTION_ID frames to be sent
-         */
-        quicly_retire_cid_set_t retire_cid;
-        /**
          * payload of DATAGRAM frames to be sent
          */
         struct {
@@ -436,7 +431,7 @@ struct st_quicly_conn_t {
         ptls_t *tls;
         ptls_handshake_properties_t handshake_properties;
         struct {
-            ptls_raw_extension_t ext[3];
+            ptls_raw_extension_t ext[2];
             ptls_buffer_t buf;
         } transport_params;
         unsigned async_in_progress : 1;
@@ -514,9 +509,9 @@ static const quicly_stream_callbacks_t crypto_stream_callbacks = {quicly_streamb
                                                                   quicly_streambuf_egress_emit, NULL, crypto_stream_receive};
 
 static int update_traffic_key_cb(ptls_update_traffic_key_t *self, ptls_t *tls, int is_enc, size_t epoch, const void *secret);
-static int initiate_close(quicly_conn_t *conn, int err, uint64_t frame_type, const char *reason_phrase);
-static int handle_close(quicly_conn_t *conn, int err, uint64_t frame_type, ptls_iovec_t reason_phrase);
-static int discard_sentmap_by_epoch(quicly_conn_t *conn, unsigned ack_epochs);
+static quicly_error_t initiate_close(quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type, const char *reason_phrase);
+static quicly_error_t handle_close(quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type, ptls_iovec_t reason_phrase);
+static quicly_error_t discard_sentmap_by_epoch(quicly_conn_t *conn, unsigned ack_epochs);
 
 quicly_cid_plaintext_t quicly_cid_plaintext_invalid = {.node_id = UINT64_MAX, .thread_id = 0xffffff};
 
@@ -556,6 +551,19 @@ const quicly_salt_t *quicly_get_salt(uint32_t protocol_version)
     default:
         return NULL;
     }
+}
+
+static int enable_with_ratio255(uint8_t ratio, void (*random_bytes)(void *, size_t))
+{
+    if (ratio == 0)
+        return 0;
+    if (ratio == 255)
+        return 1;
+
+    /* approximate using 255*257=256*256-1 */
+    uint16_t r;
+    random_bytes(&r, sizeof(r));
+    return r < ratio * 257u;
 }
 
 static void lock_now(quicly_conn_t *conn, int is_reentrant)
@@ -861,7 +869,7 @@ static void assert_consistency(quicly_conn_t *conn, int timer_must_be_in_future)
         assert(conn->stash.now < conn->egress.loss.alarm_at);
 }
 
-static int on_invalid_ack(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_invalid_ack(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     if (acked)
         return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
@@ -894,7 +902,7 @@ static void init_max_streams(struct st_quicly_max_streams_t *m)
     quicly_maxsender_init(&m->blocked_sender, -1);
 }
 
-static int update_max_streams(struct st_quicly_max_streams_t *m, uint64_t count)
+static quicly_error_t update_max_streams(struct st_quicly_max_streams_t *m, uint64_t count)
 {
     if (count > (uint64_t)1 << 60)
         return QUICLY_TRANSPORT_ERROR_STREAM_LIMIT;
@@ -1014,27 +1022,17 @@ static size_t local_cid_size(const quicly_conn_t *conn)
 }
 
 /**
- * set up an internal record to send RETIRE_CONNECTION_ID frame later
+ * Resets CIDs associated to paths if they are being retired. To maximize the chance of having enough number of CIDs to run all
+ * paths when new CIDs are provided through multiple NCID frames possibly scattered over multiple packets, CIDs are reassigned to
+ * the paths lazily.
  */
-static void schedule_retire_connection_id_frame(quicly_conn_t *conn, uint64_t sequence)
+static void dissociate_cid(quicly_conn_t *conn, uint64_t sequence)
 {
-    quicly_retire_cid_push(&conn->egress.retire_cid, sequence);
-    conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
-}
-
-static void retire_connection_id(quicly_conn_t *conn, uint64_t sequence)
-{
-    /* Reset path CIDs that are being retired. To maximize the chance of having enough number of CIDs to run all paths when new CIDs
-     * are provided through multiple NCID frames possibly scattered over multiple packets, CIDs are reassigned to the paths lazily.
-     */
     for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->paths); ++i) {
         struct st_quicly_conn_path_t *path = conn->paths[i];
         if (path != NULL && path->dcid == sequence)
             path->dcid = UINT64_MAX;
     }
-
-    quicly_remote_cid_unregister(&conn->super.remote.cid_set, sequence);
-    schedule_retire_connection_id_frame(conn, sequence);
 }
 
 static int write_crypto_data(quicly_conn_t *conn, ptls_buffer_t *tlsbuf, size_t epoch_offsets[5])
@@ -1058,6 +1056,29 @@ static int write_crypto_data(quicly_conn_t *conn, ptls_buffer_t *tlsbuf, size_t 
     return 0;
 }
 
+/**
+ * compresses a quicly error code into an int, converting QUIC transport error codes into negative ints
+ */
+static int compress_handshake_result(quicly_error_t quicly_err)
+{
+    if (QUICLY_ERROR_IS_QUIC_TRANSPORT(quicly_err)) {
+        assert(QUICLY_ERROR_GET_ERROR_CODE(quicly_err) <= INT32_MAX);
+        return (int)-QUICLY_ERROR_GET_ERROR_CODE(quicly_err);
+    } else {
+        assert(0 <= quicly_err && quicly_err < INT_MAX);
+        return (int)quicly_err;
+    }
+}
+
+static quicly_error_t expand_handshake_result(int compressed_err)
+{
+    if (compressed_err < 0) {
+        return QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(-compressed_err);
+    } else {
+        return compressed_err;
+    }
+}
+
 static void crypto_handshake(quicly_conn_t *conn, size_t in_epoch, ptls_iovec_t input)
 {
     ptls_buffer_t output;
@@ -1067,8 +1088,8 @@ static void crypto_handshake(quicly_conn_t *conn, size_t in_epoch, ptls_iovec_t 
 
     ptls_buffer_init(&output, "", 0);
 
-    int handshake_result = ptls_handle_message(conn->crypto.tls, &output, epoch_offsets, in_epoch, input.base, input.len,
-                                               &conn->crypto.handshake_properties);
+    quicly_error_t handshake_result = expand_handshake_result(ptls_handle_message(
+        conn->crypto.tls, &output, epoch_offsets, in_epoch, input.base, input.len, &conn->crypto.handshake_properties));
     QUICLY_PROBE(CRYPTO_HANDSHAKE, conn, conn->stash.now, handshake_result);
     QUICLY_LOG_CONN(crypto_handshake, conn, { PTLS_LOG_ELEMENT_SIGNED(ret, handshake_result); });
     switch (handshake_result) {
@@ -1083,8 +1104,10 @@ static void crypto_handshake(quicly_conn_t *conn, size_t in_epoch, ptls_iovec_t 
         break;
     default:
         initiate_close(conn,
-                       PTLS_ERROR_GET_CLASS(handshake_result) == PTLS_ERROR_CLASS_SELF_ALERT ? handshake_result
-                                                                                             : QUICLY_TRANSPORT_ERROR_INTERNAL,
+                       QUICLY_ERROR_IS_QUIC_TRANSPORT(handshake_result) ||
+                               PTLS_ERROR_GET_CLASS(handshake_result) == PTLS_ERROR_CLASS_SELF_ALERT
+                           ? handshake_result
+                           : QUICLY_TRANSPORT_ERROR_INTERNAL,
                        QUICLY_FRAME_TYPE_CRYPTO, NULL);
         goto Exit;
     }
@@ -1095,7 +1118,7 @@ static void crypto_handshake(quicly_conn_t *conn, size_t in_epoch, ptls_iovec_t 
             dispose_cipher(&conn->application->cipher.egress.key);
             conn->application->cipher.egress.key = (struct st_quicly_cipher_context_t){NULL};
             /* retire all packets with ack_epoch == 3; they are all 0-RTT packets */
-            int ret;
+            quicly_error_t ret;
             if ((ret = discard_sentmap_by_epoch(conn, 1u << QUICLY_EPOCH_1RTT)) != 0) {
                 initiate_close(conn, ret, QUICLY_FRAME_TYPE_CRYPTO, NULL);
                 goto Exit;
@@ -1264,7 +1287,7 @@ static int should_send_max_streams(quicly_conn_t *conn, int uni)
     return 1;
 }
 
-static void destroy_stream(quicly_stream_t *stream, int err)
+static void destroy_stream(quicly_stream_t *stream, quicly_error_t err)
 {
     quicly_conn_t *conn = stream->conn;
 
@@ -1297,7 +1320,7 @@ static void destroy_stream(quicly_stream_t *stream, int err)
     free(stream);
 }
 
-static void destroy_all_streams(quicly_conn_t *conn, int err, int including_crypto_streams)
+static void destroy_all_streams(quicly_conn_t *conn, quicly_error_t err, int including_crypto_streams)
 {
     quicly_stream_t *stream;
     kh_foreach_value(conn->streams, stream, {
@@ -1308,12 +1331,12 @@ static void destroy_all_streams(quicly_conn_t *conn, int err, int including_cryp
     assert(quicly_num_streams(conn) == 0);
 }
 
-int quicly_foreach_stream(quicly_conn_t *conn, void *thunk, int (*cb)(void *thunk, quicly_stream_t *stream))
+int64_t quicly_foreach_stream(quicly_conn_t *conn, void *thunk, int64_t (*cb)(void *thunk, quicly_stream_t *stream))
 {
     quicly_stream_t *stream;
     kh_foreach_value(conn->streams, stream, {
         if (stream->stream_id >= 0) {
-            int ret = cb(thunk, stream);
+            int64_t ret = cb(thunk, stream);
             if (ret != 0)
                 return ret;
         }
@@ -1351,7 +1374,7 @@ struct sockaddr *quicly_get_peername(quicly_conn_t *conn)
     return &conn->paths[0]->address.remote.sa;
 }
 
-int quicly_get_stats(quicly_conn_t *conn, quicly_stats_t *stats)
+quicly_error_t quicly_get_stats(quicly_conn_t *conn, quicly_stats_t *stats)
 {
     /* copy the pre-built stats fields */
     memcpy(stats, &conn->super.stats, sizeof(conn->super.stats));
@@ -1367,12 +1390,11 @@ int quicly_get_stats(quicly_conn_t *conn, quicly_stats_t *stats)
     }
     quicly_ratemeter_report(&conn->egress.ratemeter, &stats->delivery_rate);
     stats->num_sentmap_packets_largest = conn->egress.loss.sentmap.num_packets_largest;
-    stats->handshake_confirmed_msec = conn->super.stats.handshake_confirmed_msec;
 
     return 0;
 }
 
-int quicly_get_delivery_rate(quicly_conn_t *conn, quicly_rate_t *delivery_rate)
+quicly_error_t quicly_get_delivery_rate(quicly_conn_t *conn, quicly_rate_t *delivery_rate)
 {
     quicly_ratemeter_report(&conn->egress.ratemeter, delivery_rate);
     return 0;
@@ -1409,7 +1431,7 @@ static void update_idle_timeout(quicly_conn_t *conn, int is_in_receive)
     if (idle_msec == INT64_MAX)
         return;
 
-    uint32_t three_pto = 3 * quicly_rtt_get_pto(&conn->egress.loss.rtt, conn->super.ctx->transport_params.max_ack_delay,
+    uint32_t three_pto = 3 * quicly_rtt_get_pto(&conn->egress.loss.rtt, conn->super.remote.transport_params.max_ack_delay,
                                                 conn->egress.loss.conf->min_pto);
     conn->idle_timeout.at = conn->stash.now + (idle_msec > three_pto ? idle_msec : three_pto);
     conn->idle_timeout.should_rearm_on_send = is_in_receive;
@@ -1523,9 +1545,9 @@ static void do_free_pn_space(struct st_quicly_pn_space_t *space)
     free(space);
 }
 
-static int record_pn(quicly_ranges_t *ranges, uint64_t pn, int *is_out_of_order)
+static quicly_error_t record_pn(quicly_ranges_t *ranges, uint64_t pn, int *is_out_of_order)
 {
-    int ret;
+    quicly_error_t ret;
 
     *is_out_of_order = 0;
 
@@ -1547,10 +1569,11 @@ static int record_pn(quicly_ranges_t *ranges, uint64_t pn, int *is_out_of_order)
     return 0;
 }
 
-static int record_receipt(struct st_quicly_pn_space_t *space, uint64_t pn, uint8_t ecn, int is_ack_only, int64_t now,
-                          int64_t *send_ack_at, uint64_t *received_out_of_order)
+static quicly_error_t record_receipt(struct st_quicly_pn_space_t *space, uint64_t pn, uint8_t ecn, int is_ack_only, int64_t now,
+                                     int64_t *send_ack_at, uint64_t *received_out_of_order)
 {
-    int ret, ack_now, is_out_of_order;
+    int ack_now, is_out_of_order;
+    quicly_error_t ret;
 
     if ((ret = record_pn(&space->ack_queue, pn, &is_out_of_order)) != 0)
         goto Exit;
@@ -1647,9 +1670,9 @@ static int setup_application_space(quicly_conn_t *conn)
     return create_handshake_flow(conn, QUICLY_EPOCH_1RTT);
 }
 
-static int discard_handshake_context(quicly_conn_t *conn, size_t epoch)
+static quicly_error_t discard_handshake_context(quicly_conn_t *conn, size_t epoch)
 {
-    int ret;
+    quicly_error_t ret;
 
     assert(epoch == QUICLY_EPOCH_INITIAL || epoch == QUICLY_EPOCH_HANDSHAKE);
 
@@ -1665,9 +1688,9 @@ static int discard_handshake_context(quicly_conn_t *conn, size_t epoch)
     return 0;
 }
 
-static int apply_remote_transport_params(quicly_conn_t *conn)
+static quicly_error_t apply_remote_transport_params(quicly_conn_t *conn)
 {
-    int ret;
+    quicly_error_t ret;
 
     conn->egress.max_data.permitted = conn->super.remote.transport_params.max_data;
     if ((ret = update_max_streams(&conn->egress.max_streams.uni, conn->super.remote.transport_params.max_streams_uni)) != 0)
@@ -1854,14 +1877,24 @@ static int new_path(quicly_conn_t *conn, size_t path_index, struct sockaddr *rem
     return 0;
 }
 
-static void do_delete_path(quicly_conn_t *conn, struct st_quicly_conn_path_t *path)
+static int do_delete_path(quicly_conn_t *conn, struct st_quicly_conn_path_t *path)
 {
-    if (path->dcid != UINT64_MAX && conn->super.remote.cid_set.cids[0].cid.len != 0)
-        retire_connection_id(conn, path->dcid);
+    int ret = 0;
+
+    if (path->dcid != UINT64_MAX && conn->super.remote.cid_set.cids[0].cid.len != 0) {
+        uint64_t cid = path->dcid;
+        dissociate_cid(conn, cid);
+        ret = quicly_remote_cid_unregister(&conn->super.remote.cid_set, cid);
+        assert(conn->super.remote.cid_set.retired.count != 0);
+        conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
+    }
+
     free(path);
+
+    return ret;
 }
 
-static void delete_path(quicly_conn_t *conn, size_t path_index)
+static int delete_path(quicly_conn_t *conn, size_t path_index)
 {
     QUICLY_PROBE(DELETE_PATH, conn, conn->stash.now, path_index);
     QUICLY_LOG_CONN(delete_path, conn, { PTLS_LOG_ELEMENT_UNSIGNED(path_index, path_index); });
@@ -1871,20 +1904,21 @@ static void delete_path(quicly_conn_t *conn, size_t path_index)
     if (path->path_challenge.send_at != INT64_MAX)
         conn->super.stats.num_paths.validation_failed += 1;
 
-    do_delete_path(conn, path);
+    return do_delete_path(conn, path);
 }
 
 /**
  * paths[0] (the default path) is freed and the path specified by `path_index` is promoted
  */
-static int promote_path(quicly_conn_t *conn, size_t path_index)
+static quicly_error_t promote_path(quicly_conn_t *conn, size_t path_index)
 {
+    quicly_error_t ret;
+
     QUICLY_PROBE(PROMOTE_PATH, conn, conn->stash.now, path_index);
     QUICLY_LOG_CONN(promote_path, conn, { PTLS_LOG_ELEMENT_UNSIGNED(path_index, path_index); });
 
     { /* mark all packets as lost, as it is unlikely that packets sent on the old path wound be acknowledged */
         quicly_sentmap_iter_t iter;
-        int ret;
         if ((ret = quicly_loss_init_sentmap_iter(&conn->egress.loss, &iter, conn->stash.now,
                                                  conn->super.remote.transport_params.max_ack_delay, 0)) != 0)
             return ret;
@@ -1899,6 +1933,8 @@ static int promote_path(quicly_conn_t *conn, size_t path_index)
     conn->egress.cc.type->cc_init->cb(
         conn->egress.cc.type->cc_init, &conn->egress.cc,
         quicly_cc_calc_initial_cwnd(conn->super.ctx->initcwnd_packets, conn->egress.max_udp_payload_size), conn->stash.now);
+    if (conn->super.stats.num_rapid_start != 0 && conn->egress.cc.type->enable_rapid_start != NULL)
+        conn->egress.cc.type->enable_rapid_start(&conn->egress.cc, conn->stash.now);
 
     /* set jumpstart target */
     calc_resume_sendrate(conn, &conn->super.stats.jumpstart.prev_rate, &conn->super.stats.jumpstart.prev_rtt);
@@ -1921,12 +1957,12 @@ static int promote_path(quicly_conn_t *conn, size_t path_index)
     conn->paths[path_index] = NULL;
     conn->super.stats.num_paths.promoted += 1;
 
-    do_delete_path(conn, path);
+    ret = do_delete_path(conn, path);
 
     /* rearm the loss timer, now that the RTT estimate has been changed */
     setup_next_send(conn);
 
-    return 0;
+    return ret;
 }
 
 static int open_path(quicly_conn_t *conn, size_t *path_index, struct sockaddr *remote_addr, struct sockaddr *local_addr)
@@ -1950,8 +1986,8 @@ static int open_path(quicly_conn_t *conn, size_t *path_index, struct sockaddr *r
         return QUICLY_ERROR_PACKET_IGNORED;
 
     /* free existing path info */
-    if (conn->paths[*path_index] != NULL)
-        delete_path(conn, *path_index);
+    if (conn->paths[*path_index] != NULL && (ret = delete_path(conn, *path_index)) != 0)
+        return ret;
 
     /* initialize new path info */
     if ((ret = new_path(conn, *path_index, remote_addr, local_addr)) != 0)
@@ -1986,11 +2022,18 @@ void quicly_free(quicly_conn_t *conn)
     QUICLY_PROBE(FREE, conn, conn->stash.now);
     QUICLY_LOG_CONN(free, conn, {});
 
-    if (QUICLY_PROBE_ENABLED(CONN_STATS)) {
+    PTLS_LOG_DEFINE_POINT(quicly, conn_stats, conn_stats_logpoint);
+    if (QUICLY_PROBE_ENABLED(CONN_STATS) ||
+        (ptls_log_point_maybe_active(&conn_stats_logpoint) &
+         ptls_log_conn_maybe_active(ptls_get_log_state(conn->crypto.tls), (const char *(*)(void *))ptls_get_server_name,
+                                    conn->crypto.tls)) != 0) {
         quicly_stats_t stats;
-        quicly_get_stats(conn, &stats);
-        QUICLY_PROBE(CONN_STATS, conn, conn->stash.now, &stats, sizeof(stats));
-        // TODO: emit stats with QUICLY_LOG_CONN()
+        if (quicly_get_stats(conn, &stats) == 0) {
+            QUICLY_PROBE(CONN_STATS, conn, conn->stash.now, &stats, sizeof(stats));
+#define EMIT_FIELD(fld, lit) PTLS_LOG__DO_ELEMENT_UNSIGNED(lit, stats.fld);
+            QUICLY_LOG_CONN(conn_stats, conn, { QUICLY_STATS_FOREACH(EMIT_FIELD); });
+#undef EMIT_FIELD
+        }
     }
 
     destroy_all_streams(conn, 0, 1);
@@ -2094,7 +2137,7 @@ Exit:
     return ret;
 }
 
-static int reinstall_initial_encryption(quicly_conn_t *conn, int err_code_if_unknown_version)
+static quicly_error_t reinstall_initial_encryption(quicly_conn_t *conn, quicly_error_t err_code_if_unknown_version)
 {
     const quicly_salt_t *salt;
 
@@ -2113,15 +2156,17 @@ static int reinstall_initial_encryption(quicly_conn_t *conn, int err_code_if_unk
         ptls_iovec_init(salt->initial, sizeof(salt->initial)), NULL);
 }
 
-static int apply_stream_frame(quicly_stream_t *stream, quicly_stream_frame_t *frame)
+static quicly_error_t apply_stream_frame(quicly_stream_t *stream, quicly_stream_frame_t *frame)
 {
-    int ret;
+    quicly_error_t ret;
 
-    QUICLY_PROBE(STREAM_RECEIVE, stream->conn, stream->conn->stash.now, stream, frame->offset, frame->data.len);
+    QUICLY_PROBE(STREAM_RECEIVE, stream->conn, stream->conn->stash.now, stream, frame->offset, frame->data.base, frame->data.len,
+                 (int)frame->is_fin);
     QUICLY_LOG_CONN(stream_receive, stream->conn, {
         PTLS_LOG_ELEMENT_SIGNED(stream_id, stream->stream_id);
         PTLS_LOG_ELEMENT_UNSIGNED(off, frame->offset);
-        PTLS_LOG_ELEMENT_UNSIGNED(len, frame->data.len);
+        PTLS_LOG_APPDATA_ELEMENT_HEXDUMP(data, frame->data.base, frame->data.len);
+        PTLS_LOG_ELEMENT_BOOL(is_fin, frame->is_fin);
     });
 
     if (quicly_recvstate_transfer_complete(&stream->recvstate))
@@ -2156,14 +2201,15 @@ static int apply_stream_frame(quicly_stream_t *stream, quicly_stream_frame_t *fr
 
     if (apply_len != 0 || quicly_recvstate_transfer_complete(&stream->recvstate)) {
         uint64_t buf_offset = frame->offset + frame->data.len - apply_len - stream->recvstate.data_off;
-        const void *apply_src = frame->data.base + frame->data.len - apply_len;
-        QUICLY_PROBE(STREAM_ON_RECEIVE, stream->conn, stream->conn->stash.now, stream, (size_t)buf_offset, apply_src, apply_len);
+        size_t apply_off = frame->data.len - apply_len;
+        QUICLY_PROBE(STREAM_ON_RECEIVE, stream->conn, stream->conn->stash.now, stream, (size_t)buf_offset, apply_off, apply_len);
         QUICLY_LOG_CONN(stream_on_receive, stream->conn, {
             PTLS_LOG_ELEMENT_SIGNED(stream_id, stream->stream_id);
-            PTLS_LOG_ELEMENT_UNSIGNED(off, buf_offset);
-            PTLS_LOG_APPDATA_ELEMENT_HEXDUMP(src, apply_src, apply_len);
+            PTLS_LOG_ELEMENT_UNSIGNED(buf_off, buf_offset);
+            PTLS_LOG_ELEMENT_UNSIGNED(apply_off, apply_off);
+            PTLS_LOG_ELEMENT_UNSIGNED(apply_len, apply_len);
         });
-        stream->callbacks->on_receive(stream, (size_t)buf_offset, apply_src, apply_len);
+        stream->callbacks->on_receive(stream, (size_t)buf_offset, frame->data.base + apply_off, apply_len);
         if (stream->conn->super.state >= QUICLY_STATE_CLOSING)
             return QUICLY_ERROR_IS_CLOSING;
     }
@@ -2263,9 +2309,9 @@ Exit:
 static const quicly_cid_t _tp_cid_ignore;
 #define tp_cid_ignore (*(quicly_cid_t *)&_tp_cid_ignore)
 
-int quicly_decode_transport_parameter_list(quicly_transport_parameters_t *params, quicly_cid_t *original_dcid,
-                                           quicly_cid_t *initial_scid, quicly_cid_t *retry_scid, void *stateless_reset_token,
-                                           const uint8_t *src, const uint8_t *end)
+quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameters_t *params, quicly_cid_t *original_dcid,
+                                                      quicly_cid_t *initial_scid, quicly_cid_t *retry_scid,
+                                                      void *stateless_reset_token, const uint8_t *src, const uint8_t *end)
 {
 /* When non-negative, tp_index contains the literal position within the list of transport parameters recognized by this function.
  * That index is being used to find duplicates using a 64-bit bitmap (found_bits). When the transport parameter is being processed,
@@ -2302,7 +2348,7 @@ int quicly_decode_transport_parameter_list(quicly_transport_parameters_t *params
     });
 
     uint64_t found_bits = 0;
-    int ret;
+    quicly_error_t ret;
 
     /* set parameters to their default values */
     *params = default_transport_params;
@@ -2540,7 +2586,7 @@ static quicly_conn_t *create_connection(quicly_context_t *ctx, uint32_t protocol
         ptls_free(tls);
         return NULL;
     }
-    if (ctx->use_pacing && (pacer = malloc(sizeof(*pacer))) == NULL) {
+    if (enable_with_ratio255(ctx->enable_ratio.pacing, ctx->tls->random_bytes) && (pacer = malloc(sizeof(*pacer))) == NULL) {
         ptls_free(tls);
         free(conn);
         return NULL;
@@ -2551,6 +2597,9 @@ static quicly_conn_t *create_connection(quicly_context_t *ctx, uint32_t protocol
     lock_now(conn, 0);
     conn->created_at = conn->stash.now;
     conn->super.stats.handshake_confirmed_msec = UINT64_MAX;
+    conn->super.stats.num_paced = pacer != NULL;
+    conn->super.stats.num_respected_app_limited =
+        enable_with_ratio255(conn->super.ctx->enable_ratio.respect_app_limited, ctx->tls->random_bytes);
     conn->crypto.tls = tls;
     if (new_path(conn, 0, remote_addr, local_addr) != 0) {
         unlock_now(conn);
@@ -2597,12 +2646,18 @@ static quicly_conn_t *create_connection(quicly_context_t *ctx, uint32_t protocol
     conn->egress.send_ack_at = INT64_MAX;
     conn->egress.send_probe_at = INT64_MAX;
     conn->super.ctx->init_cc->cb(conn->super.ctx->init_cc, &conn->egress.cc, initcwnd, conn->stash.now);
+    if (conn->egress.cc.type->enable_rapid_start != NULL &&
+        enable_with_ratio255(conn->super.ctx->enable_ratio.rapid_start, conn->super.ctx->tls->random_bytes)) {
+        conn->egress.cc.type->enable_rapid_start(&conn->egress.cc, conn->stash.now);
+        conn->super.stats.num_rapid_start = 1;
+    }
     if (pacer != NULL) {
         conn->egress.pacer = pacer;
         quicly_pacer_reset(conn->egress.pacer);
     }
-    conn->egress.ecn.state = conn->super.ctx->enable_ecn ? QUICLY_ECN_PROBING : QUICLY_ECN_OFF;
-    quicly_retire_cid_init(&conn->egress.retire_cid);
+    conn->egress.ecn.state = enable_with_ratio255(conn->super.ctx->enable_ratio.ecn, conn->super.ctx->tls->random_bytes)
+                                 ? QUICLY_ECN_PROBING
+                                 : QUICLY_ECN_OFF;
     quicly_linklist_init(&conn->egress.pending_streams.blocked.uni);
     quicly_linklist_init(&conn->egress.pending_streams.blocked.bidi);
     quicly_linklist_init(&conn->egress.pending_streams.control);
@@ -2632,7 +2687,7 @@ static quicly_conn_t *create_connection(quicly_context_t *ctx, uint32_t protocol
 static int client_collected_extensions(ptls_t *tls, ptls_handshake_properties_t *properties, ptls_raw_extension_t *slots)
 {
     quicly_conn_t *conn = (void *)((char *)properties - offsetof(quicly_conn_t, crypto.handshake_properties));
-    int ret;
+    quicly_error_t ret;
 
     assert(properties->client.early_data_acceptance != PTLS_EARLY_DATA_ACCEPTANCE_UNKNOWN);
 
@@ -2699,13 +2754,13 @@ static int client_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
     ack_frequency_set_next_update_at(conn);
 
 Exit:
-    return ret; /* negative error codes used to transmit QUIC errors through picotls */
+    return compress_handshake_result(ret);
 }
 
-int quicly_connect(quicly_conn_t **_conn, quicly_context_t *ctx, const char *server_name, struct sockaddr *dest_addr,
-                   struct sockaddr *src_addr, const quicly_cid_plaintext_t *new_cid, ptls_iovec_t address_token,
-                   ptls_handshake_properties_t *handshake_properties, const quicly_transport_parameters_t *resumed_transport_params,
-                   void *appdata)
+quicly_error_t quicly_connect(quicly_conn_t **_conn, quicly_context_t *ctx, const char *server_name, struct sockaddr *dest_addr,
+                              struct sockaddr *src_addr, const quicly_cid_plaintext_t *new_cid, ptls_iovec_t address_token,
+                              ptls_handshake_properties_t *handshake_properties,
+                              const quicly_transport_parameters_t *resumed_transport_params, void *appdata)
 {
     const quicly_salt_t *salt;
     quicly_conn_t *conn = NULL;
@@ -2713,7 +2768,7 @@ int quicly_connect(quicly_conn_t **_conn, quicly_context_t *ctx, const char *ser
     ptls_buffer_t buf;
     size_t epoch_offsets[5] = {0};
     size_t max_early_data_size = 0;
-    int ret;
+    quicly_error_t ret;
 
     if ((salt = quicly_get_salt(ctx->initial_version)) == NULL) {
         if ((ctx->initial_version & 0x0f0f0f0f) == 0x0a0a0a0a) {
@@ -2763,19 +2818,17 @@ int quicly_connect(quicly_conn_t **_conn, quicly_context_t *ctx, const char *ser
              NULL, NULL, conn->super.ctx->expand_client_hello ? conn->super.ctx->initial_egress_max_udp_payload_size : 0)) != 0)
         goto Exit;
     conn->crypto.transport_params.ext[0] =
-        (ptls_raw_extension_t){QUICLY_TLS_EXTENSION_TYPE_TRANSPORT_PARAMETERS_FINAL,
+        (ptls_raw_extension_t){get_transport_parameters_extension_id(conn->super.version),
                                {conn->crypto.transport_params.buf.base, conn->crypto.transport_params.buf.off}};
-    conn->crypto.transport_params.ext[1] =
-        (ptls_raw_extension_t){QUICLY_TLS_EXTENSION_TYPE_TRANSPORT_PARAMETERS_DRAFT,
-                               {conn->crypto.transport_params.buf.base, conn->crypto.transport_params.buf.off}};
-    conn->crypto.transport_params.ext[2] = (ptls_raw_extension_t){UINT16_MAX};
+    conn->crypto.transport_params.ext[1] = (ptls_raw_extension_t){UINT16_MAX};
     conn->crypto.handshake_properties.additional_extensions = conn->crypto.transport_params.ext;
     conn->crypto.handshake_properties.collected_extensions = client_collected_extensions;
 
     ptls_buffer_init(&buf, "", 0);
     if (resumed_transport_params != NULL)
         conn->crypto.handshake_properties.client.max_early_data_size = &max_early_data_size;
-    ret = ptls_handle_message(conn->crypto.tls, &buf, epoch_offsets, 0, NULL, 0, &conn->crypto.handshake_properties);
+    ret = expand_handshake_result(
+        ptls_handle_message(conn->crypto.tls, &buf, epoch_offsets, 0, NULL, 0, &conn->crypto.handshake_properties));
     conn->crypto.handshake_properties.client.max_early_data_size = NULL;
     if (ret != PTLS_ERROR_IN_PROGRESS) {
         assert(ret > 0); /* no QUIC errors */
@@ -2816,7 +2869,7 @@ static int server_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
 {
     quicly_conn_t *conn = (void *)((char *)properties - offsetof(quicly_conn_t, crypto.handshake_properties));
     quicly_cid_t initial_scid;
-    int ret;
+    quicly_error_t ret;
 
     if (slots[0].type == UINT16_MAX) {
         ret = PTLS_ALERT_MISSING_EXTENSION;
@@ -2875,7 +2928,7 @@ static int server_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
     ret = 0;
 
 Exit:
-    return ret;
+    return compress_handshake_result(ret);
 }
 
 static size_t aead_decrypt_core(ptls_aead_context_t *aead, uint64_t pn, quicly_decoded_packet_t *packet, size_t aead_off)
@@ -2946,15 +2999,15 @@ static int aead_decrypt_1rtt(void *ctx, uint64_t pn, quicly_decoded_packet_t *pa
     return 0;
 }
 
-static int do_decrypt_packet(ptls_cipher_context_t *header_protection,
-                             int (*aead_cb)(void *, uint64_t, quicly_decoded_packet_t *, size_t, size_t *), void *aead_ctx,
-                             uint64_t *next_expected_pn, quicly_decoded_packet_t *packet, uint64_t *pn, ptls_iovec_t *payload)
+static quicly_error_t do_decrypt_packet(ptls_cipher_context_t *header_protection,
+                                        int (*aead_cb)(void *, uint64_t, quicly_decoded_packet_t *, size_t, size_t *),
+                                        void *aead_ctx, uint64_t *next_expected_pn, quicly_decoded_packet_t *packet, uint64_t *pn,
+                                        ptls_iovec_t *payload)
 {
     size_t encrypted_len = packet->octets.len - packet->encrypted_off;
     uint8_t hpmask[5] = {0};
     uint32_t pnbits = 0;
     size_t pnlen, ptlen, i;
-    int ret;
 
     /* decipher the header protection, as well as obtaining pnbits, pnlen */
     if (encrypted_len < header_protection->algo->iv_size + QUICLY_MAX_PN_SIZE) {
@@ -2974,6 +3027,7 @@ static int do_decrypt_packet(ptls_cipher_context_t *header_protection,
     *pn = quicly_determine_packet_number(pnbits, pnlen * 8, *next_expected_pn);
 
     /* AEAD decryption */
+    int ret;
     if ((ret = (*aead_cb)(aead_ctx, *pn, packet, aead_off, &ptlen)) != 0) {
         return ret;
     }
@@ -2984,11 +3038,12 @@ static int do_decrypt_packet(ptls_cipher_context_t *header_protection,
     return 0;
 }
 
-static int decrypt_packet(ptls_cipher_context_t *header_protection,
-                          int (*aead_cb)(void *, uint64_t, quicly_decoded_packet_t *, size_t, size_t *), void *aead_ctx,
-                          uint64_t *next_expected_pn, quicly_decoded_packet_t *packet, uint64_t *pn, ptls_iovec_t *payload)
+static quicly_error_t decrypt_packet(ptls_cipher_context_t *header_protection,
+                                     int (*aead_cb)(void *, uint64_t, quicly_decoded_packet_t *, size_t, size_t *), void *aead_ctx,
+                                     uint64_t *next_expected_pn, quicly_decoded_packet_t *packet, uint64_t *pn,
+                                     ptls_iovec_t *payload)
 {
-    int ret;
+    quicly_error_t ret;
 
     /* decrypt ourselves, or use the pre-decrypted input */
     if (packet->decrypted.pn == UINT64_MAX) {
@@ -3021,8 +3076,8 @@ static int decrypt_packet(ptls_cipher_context_t *header_protection,
     return 0;
 }
 
-static int do_on_ack_ack(quicly_conn_t *conn, const quicly_sent_packet_t *packet, uint64_t start, uint64_t start_length,
-                         struct st_quicly_sent_ack_additional_t *additional, size_t additional_capacity)
+static quicly_error_t do_on_ack_ack(quicly_conn_t *conn, const quicly_sent_packet_t *packet, uint64_t start, uint64_t start_length,
+                                    struct st_quicly_sent_ack_additional_t *additional, size_t additional_capacity)
 {
     /* find the pn space */
     struct st_quicly_pn_space_t *space;
@@ -3065,7 +3120,7 @@ static int do_on_ack_ack(quicly_conn_t *conn, const quicly_sent_packet_t *packet
     return 0;
 }
 
-static int on_ack_ack_ranges64(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_ack_ranges64(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
 
@@ -3076,7 +3131,7 @@ static int on_ack_ack_ranges64(quicly_sentmap_t *map, const quicly_sent_packet_t
                  : 0;
 }
 
-static int on_ack_ack_ranges8(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_ack_ranges8(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
 
@@ -3087,15 +3142,15 @@ static int on_ack_ack_ranges8(quicly_sentmap_t *map, const quicly_sent_packet_t 
                  : 0;
 }
 
-static int on_ack_stream_ack_one(quicly_conn_t *conn, quicly_stream_id_t stream_id, quicly_sendstate_sent_t *sent)
+static quicly_error_t on_ack_stream_ack_one(quicly_conn_t *conn, quicly_stream_id_t stream_id, quicly_sendstate_sent_t *sent)
 {
     quicly_stream_t *stream;
-    int ret;
 
     if ((stream = quicly_get_stream(conn, stream_id)) == NULL)
         return 0;
 
     size_t bytes_to_shift;
+    int ret;
     if ((ret = quicly_sendstate_acked(&stream->sendstate, sent, &bytes_to_shift)) != 0)
         return ret;
     if (bytes_to_shift != 0) {
@@ -3115,22 +3170,20 @@ static int on_ack_stream_ack_one(quicly_conn_t *conn, quicly_stream_id_t stream_
     return 0;
 }
 
-static int on_ack_stream_ack_cached(quicly_conn_t *conn)
+static quicly_error_t on_ack_stream_ack_cached(quicly_conn_t *conn)
 {
-    int ret;
-
     if (conn->stash.on_ack_stream.active_acked_cache.stream_id == INT64_MIN)
         return 0;
-    ret = on_ack_stream_ack_one(conn, conn->stash.on_ack_stream.active_acked_cache.stream_id,
-                                &conn->stash.on_ack_stream.active_acked_cache.args);
+    quicly_error_t ret = on_ack_stream_ack_one(conn, conn->stash.on_ack_stream.active_acked_cache.stream_id,
+                                               &conn->stash.on_ack_stream.active_acked_cache.args);
     conn->stash.on_ack_stream.active_acked_cache.stream_id = INT64_MIN;
     return ret;
 }
 
-static int on_ack_stream(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_stream(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
-    int ret;
+    quicly_error_t ret;
 
     if (acked) {
 
@@ -3183,7 +3236,8 @@ static int on_ack_stream(quicly_sentmap_t *map, const quicly_sent_packet_t *pack
     return 0;
 }
 
-static int on_ack_max_stream_data(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_max_stream_data(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                             quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     quicly_stream_t *stream;
@@ -3201,7 +3255,7 @@ static int on_ack_max_stream_data(quicly_sentmap_t *map, const quicly_sent_packe
     return 0;
 }
 
-static int on_ack_max_data(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_max_data(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
 
@@ -3214,7 +3268,7 @@ static int on_ack_max_data(quicly_sentmap_t *map, const quicly_sent_packet_t *pa
     return 0;
 }
 
-static int on_ack_max_streams(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_max_streams(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     quicly_maxsender_t *maxsender = sent->data.max_streams.uni ? &conn->ingress.max_streams.uni : &conn->ingress.max_streams.bidi;
@@ -3234,7 +3288,7 @@ static void on_ack_stream_state_sender(quicly_sender_state_t *sender_state, int 
     *sender_state = acked ? QUICLY_SENDER_STATE_ACKED : QUICLY_SENDER_STATE_SEND;
 }
 
-static int on_ack_reset_stream(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_reset_stream(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     quicly_stream_t *stream;
@@ -3248,7 +3302,7 @@ static int on_ack_reset_stream(quicly_sentmap_t *map, const quicly_sent_packet_t
     return 0;
 }
 
-static int on_ack_stop_sending(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_stop_sending(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     quicly_stream_t *stream;
@@ -3262,7 +3316,8 @@ static int on_ack_stop_sending(quicly_sentmap_t *map, const quicly_sent_packet_t
     return 0;
 }
 
-static int on_ack_streams_blocked(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_streams_blocked(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                             quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     struct st_quicly_max_streams_t *m =
@@ -3277,7 +3332,8 @@ static int on_ack_streams_blocked(quicly_sentmap_t *map, const quicly_sent_packe
     return 0;
 }
 
-static int on_ack_handshake_done(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_handshake_done(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                            quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
 
@@ -3290,7 +3346,7 @@ static int on_ack_handshake_done(quicly_sentmap_t *map, const quicly_sent_packet
     return 0;
 }
 
-static int on_ack_data_blocked(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_data_blocked(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
 
@@ -3306,8 +3362,8 @@ static int on_ack_data_blocked(quicly_sentmap_t *map, const quicly_sent_packet_t
     return 0;
 }
 
-static int on_ack_stream_data_blocked_frame(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
-                                            quicly_sent_t *sent)
+static quicly_error_t on_ack_stream_data_blocked_frame(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                                       quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     quicly_stream_t *stream;
@@ -3327,7 +3383,7 @@ static int on_ack_stream_data_blocked_frame(quicly_sentmap_t *map, const quicly_
     return 0;
 }
 
-static int on_ack_new_token(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_new_token(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
 
@@ -3348,7 +3404,8 @@ static int on_ack_new_token(quicly_sentmap_t *map, const quicly_sent_packet_t *p
     return 0;
 }
 
-static int on_ack_new_connection_id(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_new_connection_id(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                               quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     uint64_t sequence = sent->data.new_connection_id.sequence;
@@ -3363,28 +3420,43 @@ static int on_ack_new_connection_id(quicly_sentmap_t *map, const quicly_sent_pac
     return 0;
 }
 
-static int on_ack_retire_connection_id(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_ack_retire_connection_id(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                                  quicly_sent_t *sent)
 {
     quicly_conn_t *conn = (quicly_conn_t *)((char *)map - offsetof(quicly_conn_t, egress.loss.sentmap));
     uint64_t sequence = sent->data.retire_connection_id.sequence;
+    int ret;
 
-    if (!acked)
-        schedule_retire_connection_id_frame(conn, sequence);
+    if (!acked) {
+        if ((ret = quicly_remote_cid_push_retired(&conn->super.remote.cid_set, sequence)) != 0)
+            return ret;
+        conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
+    }
 
     return 0;
 }
 
 static uint32_t calc_pacer_send_rate(quicly_conn_t *conn)
 {
-    /* The multiplier uses a hard-coded value of 2x in both the slow start and the congestion avoidance phases. This differs from
-     * Linux, which uses 1.25x for the latter. The rationale behind this choice is that 1.25x is not sufficiently aggressive
-     * immediately after a loss event. Following a loss event, the congestion window (CWND) is halved (i.e., beta), but the RTT
-     * remains high for one RTT and SRTT can remain high even loger, since it is a moving average adjusted with each ACK received.
-     * Consequently, if the multiplier is set to 1.25x, the calculated send rate could drop to as low as 1.25 * 1/2 = 0.625. By
-     * using a 2x multiplier, the send rate is guaranteed to become no less than that immediately before the loss event, which would
-     * have been the link throughput. */
-    return quicly_pacer_calc_send_rate(quicly_cc_in_jumpstart(&conn->egress.cc) ? 1 : 2, conn->egress.cc.cwnd,
-                                       conn->egress.loss.rtt.smoothed);
+    uint32_t multiplier;
+
+    if (conn->egress.cc.num_loss_episodes == 0) {
+        if (quicly_cc_in_jumpstart(&conn->egress.cc)) {
+            multiplier = 1;
+        } else {
+            multiplier = quicly_cc_rapid_start_use_3x(&conn->egress.cc.rapid_start, &conn->egress.loss.rtt) ? 3 : 2;
+        }
+    } else {
+        /* We use of 2x during congestion avoidance, which is different from Linux using 1.25x. The rationale behind this choice is
+         * that 1.25x is not sufficiently aggressive immediately after a loss event. Following a loss event, the congestion window
+         * (CWND) is halved (i.e., beta), but the RTT remains high for one RTT and SRTT can remain high even loger, since it is a
+         * moving average adjusted with each ACK received. Consequently, if the multiplier is set to 1.25x, the calculated send rate
+         * could drop to as low as 1.25 * 1/2 = 0.625. By using a 2x multiplier, the send rate is guaranteed to become no less than
+         * that immediately before the loss event, which would have been the link throughput. */
+        multiplier = 2;
+    }
+
+    return quicly_pacer_calc_send_rate(multiplier, conn->egress.cc.cwnd, conn->egress.loss.rtt.smoothed);
 }
 
 static int should_send_datagram_frame(quicly_conn_t *conn)
@@ -3640,7 +3712,7 @@ struct st_quicly_send_context_t {
     unsigned recalc_send_probe_at : 1;
 };
 
-static int commit_send_packet(quicly_conn_t *conn, quicly_send_context_t *s, int coalesced)
+static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_context_t *s, int coalesced)
 {
     size_t datagram_size, packet_bytes_in_flight;
 
@@ -3746,7 +3818,7 @@ static int commit_send_packet(quicly_conn_t *conn, quicly_send_context_t *s, int
      * an ACK for that gap. */
     if (conn->egress.packet_number >= conn->egress.next_pn_to_skip && !QUICLY_PACKET_IS_LONG_HEADER(s->current.first_byte) &&
         conn->super.state < QUICLY_STATE_CLOSING) {
-        int ret;
+        quicly_error_t ret;
         if ((ret = quicly_sentmap_prepare(&conn->egress.loss.sentmap, conn->egress.packet_number, conn->stash.now,
                                           QUICLY_EPOCH_1RTT)) != 0)
             return ret;
@@ -3776,9 +3848,11 @@ enum allocate_frame_type {
     ALLOCATE_FRAME_TYPE_ACK_ELICITING_NO_CC,
 };
 
-static int do_allocate_frame(quicly_conn_t *conn, quicly_send_context_t *s, size_t min_space, enum allocate_frame_type frame_type)
+static quicly_error_t do_allocate_frame(quicly_conn_t *conn, quicly_send_context_t *s, size_t min_space,
+                                        enum allocate_frame_type frame_type)
 {
-    int coalescible, ret;
+    int coalescible;
+    quicly_error_t ret;
 
     assert((s->current.first_byte & QUICLY_QUIC_BIT) != 0);
 
@@ -3906,10 +3980,10 @@ TargetReady:
     return 0;
 }
 
-static int allocate_ack_eliciting_frame(quicly_conn_t *conn, quicly_send_context_t *s, size_t min_space, quicly_sent_t **sent,
-                                        quicly_sent_acked_cb acked)
+static quicly_error_t allocate_ack_eliciting_frame(quicly_conn_t *conn, quicly_send_context_t *s, size_t min_space,
+                                                   quicly_sent_t **sent, quicly_sent_acked_cb acked)
 {
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = do_allocate_frame(conn, s, min_space, ALLOCATE_FRAME_TYPE_ACK_ELICITING)) != 0)
         return ret;
@@ -3919,10 +3993,10 @@ static int allocate_ack_eliciting_frame(quicly_conn_t *conn, quicly_send_context
     return ret;
 }
 
-static int send_ack(quicly_conn_t *conn, struct st_quicly_pn_space_t *space, quicly_send_context_t *s)
+static quicly_error_t send_ack(quicly_conn_t *conn, struct st_quicly_pn_space_t *space, quicly_send_context_t *s)
 {
     uint64_t ack_delay;
-    int ret;
+    quicly_error_t ret;
 
     if (space->ack_queue.num_ranges == 0)
         return 0;
@@ -4016,11 +4090,11 @@ Emit: /* emit an ACK frame */
     return ret;
 }
 
-static int prepare_stream_state_sender(quicly_stream_t *stream, quicly_sender_state_t *sender, quicly_send_context_t *s,
-                                       size_t min_space, quicly_sent_acked_cb ack_cb)
+static quicly_error_t prepare_stream_state_sender(quicly_stream_t *stream, quicly_sender_state_t *sender, quicly_send_context_t *s,
+                                                  size_t min_space, quicly_sent_acked_cb ack_cb)
 {
     quicly_sent_t *sent;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = allocate_ack_eliciting_frame(stream->conn, s, min_space, &sent, ack_cb)) != 0)
         return ret;
@@ -4030,9 +4104,9 @@ static int prepare_stream_state_sender(quicly_stream_t *stream, quicly_sender_st
     return 0;
 }
 
-static int send_control_frames_of_stream(quicly_stream_t *stream, quicly_send_context_t *s)
+static quicly_error_t send_control_frames_of_stream(quicly_stream_t *stream, quicly_send_context_t *s)
 {
-    int ret;
+    quicly_error_t ret;
 
     /* send STOP_SENDING if necessary */
     if (stream->_send_aux.stop_sending.sender_state == QUICLY_SENDER_STATE_SEND) {
@@ -4111,9 +4185,9 @@ static int send_control_frames_of_stream(quicly_stream_t *stream, quicly_send_co
     return 0;
 }
 
-static int send_stream_control_frames(quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t send_stream_control_frames(quicly_conn_t *conn, quicly_send_context_t *s)
 {
-    int ret = 0;
+    quicly_error_t ret = 0;
 
     while (s->num_datagrams != s->max_datagrams && quicly_linklist_is_linked(&conn->egress.pending_streams.control)) {
         quicly_stream_t *stream =
@@ -4210,14 +4284,15 @@ static inline void adjust_stream_frame_layout(uint8_t **dst, uint8_t *const dst_
     *dst += *len;
 }
 
-int quicly_send_stream(quicly_stream_t *stream, quicly_send_context_t *s)
+quicly_error_t quicly_send_stream(quicly_stream_t *stream, quicly_send_context_t *s)
 {
     uint64_t off = stream->sendstate.pending.ranges[0].start;
     quicly_sent_t *sent;
     uint8_t *dst; /* this pointer points to the current write position within the frame being built, while `s->dst` points to the
                    * beginning of the frame. */
     size_t len;
-    int ret, wrote_all, is_fin;
+    int wrote_all, is_fin;
+    quicly_error_t ret;
 
     /* write frame type, stream_id and offset, calculate capacity (and store that in `len`) */
     if (stream->stream_id < 0) {
@@ -4329,12 +4404,13 @@ UpdateState:
     if (off < stream->sendstate.size_inflight)
         stream->conn->super.stats.num_bytes.stream_data_resent +=
             (stream->sendstate.size_inflight < off + len ? stream->sendstate.size_inflight : off + len) - off;
-    QUICLY_PROBE(STREAM_SEND, stream->conn, stream->conn->stash.now, stream, off, len, is_fin);
+    QUICLY_PROBE(STREAM_SEND, stream->conn, stream->conn->stash.now, stream, off, s->dst - len, len, is_fin, wrote_all);
     QUICLY_LOG_CONN(stream_send, stream->conn, {
         PTLS_LOG_ELEMENT_SIGNED(stream_id, stream->stream_id);
         PTLS_LOG_ELEMENT_UNSIGNED(off, off);
-        PTLS_LOG_ELEMENT_UNSIGNED(len, len);
+        PTLS_LOG_APPDATA_ELEMENT_HEXDUMP(data, s->dst - len, len);
         PTLS_LOG_ELEMENT_BOOL(is_fin, is_fin);
+        PTLS_LOG_ELEMENT_BOOL(wrote_all, wrote_all);
     });
 
     QUICLY_PROBE(QUICTRACE_SEND_STREAM, stream->conn, stream->conn->stash.now, stream, off, len, is_fin);
@@ -4359,18 +4435,18 @@ UpdateState:
     return 0;
 }
 
-static inline int init_acks_iter(quicly_conn_t *conn, quicly_sentmap_iter_t *iter)
+static inline quicly_error_t init_acks_iter(quicly_conn_t *conn, quicly_sentmap_iter_t *iter)
 {
     return quicly_loss_init_sentmap_iter(&conn->egress.loss, iter, conn->stash.now,
                                          conn->super.remote.transport_params.max_ack_delay,
                                          conn->super.state >= QUICLY_STATE_CLOSING);
 }
 
-int discard_sentmap_by_epoch(quicly_conn_t *conn, unsigned ack_epochs)
+quicly_error_t discard_sentmap_by_epoch(quicly_conn_t *conn, unsigned ack_epochs)
 {
     quicly_sentmap_iter_t iter;
     const quicly_sent_packet_t *sent;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = init_acks_iter(conn, &iter)) != 0)
         return ret;
@@ -4390,11 +4466,11 @@ int discard_sentmap_by_epoch(quicly_conn_t *conn, unsigned ack_epochs)
 /**
  * Mark frames of given epoch as pending, until `*bytes_to_mark` becomes zero.
  */
-static int mark_frames_on_pto(quicly_conn_t *conn, uint8_t ack_epoch, size_t *bytes_to_mark)
+static quicly_error_t mark_frames_on_pto(quicly_conn_t *conn, uint8_t ack_epoch, size_t *bytes_to_mark)
 {
     quicly_sentmap_iter_t iter;
     const quicly_sent_packet_t *sent;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = init_acks_iter(conn, &iter)) != 0)
         return ret;
@@ -4450,14 +4526,14 @@ static void on_loss_detected(quicly_loss_t *loss, const quicly_sent_packet_t *lo
                  conn->egress.loss.sentmap.bytes_in_flight);
 }
 
-static int send_max_streams(quicly_conn_t *conn, int uni, quicly_send_context_t *s)
+static quicly_error_t send_max_streams(quicly_conn_t *conn, int uni, quicly_send_context_t *s)
 {
     if (!should_send_max_streams(conn, uni))
         return 0;
 
     quicly_maxsender_t *maxsender = uni ? &conn->ingress.max_streams.uni : &conn->ingress.max_streams.bidi;
     struct st_quicly_conn_streamgroup_state_t *group = uni ? &conn->super.remote.uni : &conn->super.remote.bidi;
-    int ret;
+    quicly_error_t ret;
 
     uint64_t new_count =
         group->next_stream_id / 4 +
@@ -4485,10 +4561,10 @@ static int send_max_streams(quicly_conn_t *conn, int uni, quicly_send_context_t 
     return 0;
 }
 
-static int send_streams_blocked(quicly_conn_t *conn, int uni, quicly_send_context_t *s)
+static quicly_error_t send_streams_blocked(quicly_conn_t *conn, int uni, quicly_send_context_t *s)
 {
     quicly_linklist_t *blocked_list = uni ? &conn->egress.pending_streams.blocked.uni : &conn->egress.pending_streams.blocked.bidi;
-    int ret;
+    quicly_error_t ret;
 
     if (!quicly_linklist_is_linked(blocked_list))
         return 0;
@@ -4547,10 +4623,10 @@ static void open_blocked_streams(quicly_conn_t *conn, int uni)
     }
 }
 
-static int send_handshake_done(quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t send_handshake_done(quicly_conn_t *conn, quicly_send_context_t *s)
 {
     quicly_sent_t *sent;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = allocate_ack_eliciting_frame(conn, s, 1, &sent, on_ack_handshake_done)) != 0)
         goto Exit;
@@ -4565,10 +4641,10 @@ Exit:
     return ret;
 }
 
-static int send_data_blocked(quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t send_data_blocked(quicly_conn_t *conn, quicly_send_context_t *s)
 {
     quicly_sent_t *sent;
-    int ret;
+    quicly_error_t ret;
 
     uint64_t offset = conn->egress.max_data.permitted;
     if ((ret = allocate_ack_eliciting_frame(conn, s, QUICLY_DATA_BLOCKED_FRAME_CAPACITY, &sent, on_ack_data_blocked)) != 0)
@@ -4676,7 +4752,7 @@ Exit:
     return buf.off;
 }
 
-static int send_resumption_token(quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t send_resumption_token(quicly_conn_t *conn, quicly_send_context_t *s)
 {
     /* fill conn->super.stats.token_sent the information we are sending now */
     calc_resume_sendrate(conn, &conn->super.stats.token_sent.rate, &conn->super.stats.token_sent.rtt);
@@ -4685,7 +4761,7 @@ static int send_resumption_token(quicly_conn_t *conn, quicly_send_context_t *s)
     ptls_buffer_t tokenbuf;
     uint8_t tokenbuf_small[128];
     quicly_sent_t *sent;
-    int ret;
+    quicly_error_t ret;
 
     ptls_buffer_init(&tokenbuf, tokenbuf_small, sizeof(tokenbuf_small));
 
@@ -4758,7 +4834,8 @@ size_t quicly_send_version_negotiation(quicly_context_t *ctx, ptls_iovec_t dest_
     return dst - (uint8_t *)payload;
 }
 
-int quicly_retry_calc_cidpair_hash(ptls_hash_algorithm_t *sha256, ptls_iovec_t client_cid, ptls_iovec_t server_cid, uint64_t *value)
+quicly_error_t quicly_retry_calc_cidpair_hash(ptls_hash_algorithm_t *sha256, ptls_iovec_t client_cid, ptls_iovec_t server_cid,
+                                              uint64_t *value)
 {
     uint8_t digest[PTLS_SHA256_DIGEST_SIZE], buf[(QUICLY_MAX_CID_LEN_V1 + 1) * 2], *p = buf;
     int ret;
@@ -4785,7 +4862,7 @@ size_t quicly_send_retry(quicly_context_t *ctx, ptls_aead_context_t *token_encry
 {
     quicly_address_token_plaintext_t token;
     ptls_buffer_t buf;
-    int ret;
+    quicly_error_t ret;
 
     assert(!(src_cid.len == odcid.len && memcmp(src_cid.base, odcid.base, src_cid.len) == 0));
 
@@ -4884,10 +4961,10 @@ static struct st_quicly_pn_space_t *setup_send_space(quicly_conn_t *conn, size_t
     return space;
 }
 
-static int send_handshake_flow(quicly_conn_t *conn, size_t epoch, quicly_send_context_t *s, int ack_only, int send_probe)
+static quicly_error_t send_handshake_flow(quicly_conn_t *conn, size_t epoch, quicly_send_context_t *s, int ack_only, int send_probe)
 {
     struct st_quicly_pn_space_t *space;
-    int ret = 0;
+    quicly_error_t ret = 0;
 
     /* setup send epoch, or return if it's impossible to send in this epoch */
     if ((space = setup_send_space(conn, epoch, s)) == NULL)
@@ -4925,11 +5002,11 @@ Exit:
     return ret;
 }
 
-static int send_connection_close(quicly_conn_t *conn, size_t epoch, quicly_send_context_t *s)
+static quicly_error_t send_connection_close(quicly_conn_t *conn, size_t epoch, quicly_send_context_t *s)
 {
     uint64_t error_code, offending_frame_type;
     const char *reason_phrase;
-    int ret;
+    quicly_error_t ret;
 
     /* setup send epoch, or return if it's impossible to send in this epoch */
     if (setup_send_space(conn, epoch, s) == NULL)
@@ -4943,7 +5020,7 @@ static int send_connection_close(quicly_conn_t *conn, size_t epoch, quicly_send_
         switch (get_epoch(s->current.first_byte)) {
         case QUICLY_EPOCH_INITIAL:
         case QUICLY_EPOCH_HANDSHAKE:
-            error_code = QUICLY_TRANSPORT_ERROR_APPLICATION;
+            error_code = QUICLY_ERROR_GET_ERROR_CODE(QUICLY_TRANSPORT_ERROR_APPLICATION);
             offending_frame_type = QUICLY_FRAME_TYPE_PADDING;
             reason_phrase = "";
             break;
@@ -4977,16 +5054,15 @@ static int send_connection_close(quicly_conn_t *conn, size_t epoch, quicly_send_
     return 0;
 }
 
-static int send_new_connection_id(quicly_conn_t *conn, quicly_send_context_t *s, struct st_quicly_local_cid_t *new_cid)
+static quicly_error_t send_new_connection_id(quicly_conn_t *conn, quicly_send_context_t *s, struct st_quicly_local_cid_t *new_cid)
 {
-    int ret;
     quicly_sent_t *sent;
     uint64_t retire_prior_to = 0; /* TODO */
+    quicly_error_t ret;
 
-    ret = allocate_ack_eliciting_frame(
-        conn, s, quicly_new_connection_id_frame_capacity(new_cid->sequence, retire_prior_to, new_cid->cid.len), &sent,
-        on_ack_new_connection_id);
-    if (ret != 0)
+    if ((ret = allocate_ack_eliciting_frame(
+             conn, s, quicly_new_connection_id_frame_capacity(new_cid->sequence, retire_prior_to, new_cid->cid.len), &sent,
+             on_ack_new_connection_id)) != 0)
         return ret;
     sent->data.new_connection_id.sequence = new_cid->sequence;
 
@@ -5007,14 +5083,13 @@ static int send_new_connection_id(quicly_conn_t *conn, quicly_send_context_t *s,
     return 0;
 }
 
-static int send_retire_connection_id(quicly_conn_t *conn, quicly_send_context_t *s, uint64_t sequence)
+static quicly_error_t send_retire_connection_id(quicly_conn_t *conn, quicly_send_context_t *s, uint64_t sequence)
 {
-    int ret;
     quicly_sent_t *sent;
+    quicly_error_t ret;
 
-    ret = allocate_ack_eliciting_frame(conn, s, quicly_retire_connection_id_frame_capacity(sequence), &sent,
-                                       on_ack_retire_connection_id);
-    if (ret != 0)
+    if ((ret = allocate_ack_eliciting_frame(conn, s, quicly_retire_connection_id_frame_capacity(sequence), &sent,
+                                            on_ack_retire_connection_id)) != 0)
         return ret;
     sent->data.retire_connection_id.sequence = sequence;
 
@@ -5027,9 +5102,9 @@ static int send_retire_connection_id(quicly_conn_t *conn, quicly_send_context_t 
     return 0;
 }
 
-static int send_path_challenge(quicly_conn_t *conn, quicly_send_context_t *s, int is_response, const uint8_t *data)
+static quicly_error_t send_path_challenge(quicly_conn_t *conn, quicly_send_context_t *s, int is_response, const uint8_t *data)
 {
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = do_allocate_frame(conn, s, QUICLY_PATH_CHALLENGE_FRAME_CAPACITY, ALLOCATE_FRAME_TYPE_NON_ACK_ELICITING)) != 0)
         return ret;
@@ -5103,7 +5178,7 @@ static int update_traffic_key_cb(ptls_update_traffic_key_t *self, ptls_t *tls, i
         break;
     case QUICLY_EPOCH_1RTT: {
         if (is_enc)
-            if ((ret = apply_remote_transport_params(conn)) != 0)
+            if ((ret = compress_handshake_result(apply_remote_transport_params(conn))) != 0)
                 return ret;
         if (conn->application == NULL && (ret = setup_application_space(conn)) != 0)
             return ret;
@@ -5140,8 +5215,8 @@ static int update_traffic_key_cb(ptls_update_traffic_key_t *self, ptls_t *tls, i
             conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
         /* send the first resumption token using the 0.5 RTT window */
         if (!quicly_is_client(conn) && conn->super.ctx->generate_resumption_token != NULL) {
-            ret = quicly_send_resumption_token(conn);
-            assert(ret == 0);
+            quicly_error_t ret64 = quicly_send_resumption_token(conn);
+            assert(ret64 == 0);
         }
 
         /* schedule NEW_CONNECTION_IDs */
@@ -5153,9 +5228,9 @@ static int update_traffic_key_cb(ptls_update_traffic_key_t *self, ptls_t *tls, i
     return 0;
 }
 
-static int send_other_control_frames(quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t send_other_control_frames(quicly_conn_t *conn, quicly_send_context_t *s)
 {
-    int ret;
+    quicly_error_t ret;
 
     /* MAX_STREAMS */
     if ((ret = send_max_streams(conn, 1, s)) != 0)
@@ -5202,13 +5277,13 @@ static int send_other_control_frames(quicly_conn_t *conn, quicly_send_context_t 
     }
 
     { /* RETIRE_CONNECTION_ID */
-        size_t i, size = quicly_retire_cid_get_num_pending(&conn->egress.retire_cid);
-        for (i = 0; i < size; i++) {
-            uint64_t sequence = conn->egress.retire_cid.sequences[i];
+        size_t i;
+        for (i = 0; i < conn->super.remote.cid_set.retired.count; ++i) {
+            uint64_t sequence = conn->super.remote.cid_set.retired.cids[i];
             if ((ret = send_retire_connection_id(conn, s, sequence)) != 0)
                 break;
         }
-        quicly_retire_cid_shift(&conn->egress.retire_cid, i);
+        quicly_remote_cid_shift_retired(&conn->super.remote.cid_set, i);
         if (ret != 0)
             return ret;
     }
@@ -5216,10 +5291,11 @@ static int send_other_control_frames(quicly_conn_t *conn, quicly_send_context_t 
     return 0;
 }
 
-static int do_send(quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
 {
-    int restrict_sending = 0, ack_only = 0, ret = 0;
+    int restrict_sending = 0, ack_only = 0;
     size_t min_packets_to_send = 0, orig_bytes_inflight = 0;
+    quicly_error_t ret = 0;
 
     /* handle timeouts */
     if (conn->idle_timeout.at <= conn->stash.now) {
@@ -5436,7 +5512,7 @@ Exit:
             conn->egress.try_jumpstart = 0;
             conn->super.stats.jumpstart.new_rtt = 0;
             conn->super.stats.jumpstart.cwnd = 0;
-            if (conn->super.ctx->use_pacing && conn->egress.cc.type->cc_jumpstart != NULL &&
+            if (conn->egress.pacer != NULL && conn->egress.cc.type->cc_jumpstart != NULL &&
                 (conn->super.ctx->default_jumpstart_cwnd_packets != 0 || conn->super.ctx->max_jumpstart_cwnd_packets != 0) &&
                 conn->egress.cc.num_loss_episodes == 0) {
                 conn->super.stats.jumpstart.new_rtt = conn->egress.loss.rtt.minimum;
@@ -5456,6 +5532,23 @@ Exit:
                  * paced across the entire RTT during jumpstart. */
                 if (conn->super.stats.jumpstart.cwnd <= conn->egress.cc.cwnd + orig_bytes_inflight)
                     conn->super.stats.jumpstart.cwnd = 0;
+            }
+            /* disable jumpstart probablistically based on the specified ratios; disablement is observable from the probes as
+             * `jumpstart.cwnd == 0` */
+            if (conn->super.stats.jumpstart.cwnd > 0) {
+                conn->super.stats.num_jumpstart_applicable = 1;
+                uint8_t ratio = conn->super.stats.jumpstart.prev_rate != 0 ? conn->super.ctx->enable_ratio.jumpstart.resume
+                                                                           : conn->super.ctx->enable_ratio.jumpstart.non_resume;
+                if (!enable_with_ratio255(ratio, conn->super.ctx->tls->random_bytes))
+                    conn->super.stats.jumpstart.cwnd = 0;
+                QUICLY_PROBE(ENTER_JUMPSTART, conn, conn->stash.now, conn->egress.packet_number,
+                             conn->super.stats.jumpstart.new_rtt, conn->egress.cc.cwnd, conn->super.stats.jumpstart.cwnd);
+                QUICLY_LOG_CONN(enter_jumpstart, conn, {
+                    PTLS_LOG_ELEMENT_UNSIGNED(pn, conn->egress.packet_number);
+                    PTLS_LOG_ELEMENT_UNSIGNED(rtt, conn->super.stats.jumpstart.new_rtt);
+                    PTLS_LOG_ELEMENT_UNSIGNED(cwnd, conn->egress.cc.cwnd);
+                    PTLS_LOG_ELEMENT_UNSIGNED(jumpstart_cwnd, conn->super.stats.jumpstart.cwnd);
+                });
             }
             if (conn->super.stats.jumpstart.cwnd > 0)
                 conn->egress.cc.type->cc_jumpstart(&conn->egress.cc, conn->super.stats.jumpstart.cwnd, conn->egress.packet_number);
@@ -5508,15 +5601,59 @@ int quicly_set_cc(quicly_conn_t *conn, quicly_cc_type_t *cc)
     return cc->cc_switch(&conn->egress.cc);
 }
 
-int quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_address_t *src, struct iovec *datagrams, size_t *num_datagrams,
-                void *buf, size_t bufsize)
+static quicly_error_t do_send_closed(quicly_conn_t *conn, quicly_send_context_t *s)
+{
+    assert(s->path_index == 0);
+
+    quicly_sentmap_iter_t iter;
+    quicly_error_t ret;
+
+    if ((ret = init_acks_iter(conn, &iter)) != 0)
+        goto Exit;
+
+    /* check if the connection can be closed now (after 3 pto) */
+    if (conn->super.state == QUICLY_STATE_DRAINING ||
+        conn->super.stats.num_frames_sent.transport_close + conn->super.stats.num_frames_sent.application_close != 0) {
+        if (quicly_sentmap_get(&iter)->packet_number == UINT64_MAX) {
+            assert(quicly_num_streams(conn) == 0);
+            ret = QUICLY_ERROR_FREE_CONNECTION;
+            goto Exit;
+        }
+    }
+
+    if (conn->super.state == QUICLY_STATE_CLOSING && conn->egress.send_ack_at <= conn->stash.now) {
+        /* destroy all streams; doing so is delayed until the emission of CONNECTION_CLOSE frame to allow quicly_close to be called
+         * from a stream handler */
+        destroy_all_streams(conn, 0, 0);
+        /* send CONNECTION_CLOSE in all possible epochs */
+        s->dcid = get_dcid(conn, 0);
+        for (size_t epoch = 0; epoch < QUICLY_NUM_EPOCHS; ++epoch) {
+            if ((ret = send_connection_close(conn, epoch, s)) != 0)
+                goto Exit;
+        }
+        if ((ret = commit_send_packet(conn, s, 0)) != 0)
+            goto Exit;
+    }
+
+    /* wait at least 1ms */
+    if ((conn->egress.send_ack_at = quicly_sentmap_get(&iter)->sent_at + get_sentmap_expiration_time(conn)) <= conn->stash.now)
+        conn->egress.send_ack_at = conn->stash.now + 1;
+
+    ret = 0;
+
+Exit:
+    return ret;
+}
+
+quicly_error_t quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_address_t *src, struct iovec *datagrams,
+                           size_t *num_datagrams, void *buf, size_t bufsize)
 {
     quicly_send_context_t s = {.current = {.first_byte = -1},
                                .datagrams = datagrams,
                                .max_datagrams = *num_datagrams,
                                .payload_buf = {.datagram = buf, .end = (uint8_t *)buf + bufsize},
                                .first_packet_number = conn->egress.packet_number};
-    int ret;
+    quicly_error_t ret;
 
     lock_now(conn, 0);
 
@@ -5547,35 +5684,7 @@ int quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_address_t *s
     }
 
     if (conn->super.state >= QUICLY_STATE_CLOSING) {
-        quicly_sentmap_iter_t iter;
-        if ((ret = init_acks_iter(conn, &iter)) != 0)
-            goto Exit;
-        /* check if the connection can be closed now (after 3 pto) */
-        if (conn->super.state == QUICLY_STATE_DRAINING ||
-            conn->super.stats.num_frames_sent.transport_close + conn->super.stats.num_frames_sent.application_close != 0) {
-            if (quicly_sentmap_get(&iter)->packet_number == UINT64_MAX) {
-                assert(quicly_num_streams(conn) == 0);
-                ret = QUICLY_ERROR_FREE_CONNECTION;
-                goto Exit;
-            }
-        }
-        if (conn->super.state == QUICLY_STATE_CLOSING && conn->egress.send_ack_at <= conn->stash.now) {
-            /* destroy all streams; doing so is delayed until the emission of CONNECTION_CLOSE frame to allow quicly_close to be
-             * called from a stream handler */
-            destroy_all_streams(conn, 0, 0);
-            /* send CONNECTION_CLOSE in all possible epochs */
-            s.dcid = get_dcid(conn, 0);
-            for (size_t epoch = 0; epoch < QUICLY_NUM_EPOCHS; ++epoch) {
-                if ((ret = send_connection_close(conn, epoch, &s)) != 0)
-                    goto Exit;
-            }
-            if ((ret = commit_send_packet(conn, &s, 0)) != 0)
-                goto Exit;
-        }
-        /* wait at least 1ms */
-        if ((conn->egress.send_ack_at = quicly_sentmap_get(&iter)->sent_at + get_sentmap_expiration_time(conn)) <= conn->stash.now)
-            conn->egress.send_ack_at = conn->stash.now + 1;
-        ret = 0;
+        ret = do_send_closed(conn, &s);
         goto Exit;
     }
 
@@ -5587,13 +5696,20 @@ int quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_address_t *s
                                                        conn->paths[s.path_index]->path_response.send_))
                 continue;
             if (conn->paths[s.path_index]->path_challenge.num_sent > conn->super.ctx->max_probe_packets) {
-                delete_path(conn, s.path_index);
+                if ((ret = delete_path(conn, s.path_index)) != 0) {
+                    initiate_close(conn, ret, QUICLY_FRAME_TYPE_PADDING, NULL);
+                    assert(conn->super.state >= QUICLY_STATE_CLOSING);
+                    s.path_index = 0;
+                    ret = do_send_closed(conn, &s);
+                    goto Exit;
+                }
                 s.recalc_send_probe_at = 1;
                 continue;
             }
             /* determine DCID to be used, if not yet been done; upon failure, this path (being secondary) is discarded */
             if (conn->paths[s.path_index]->dcid == UINT64_MAX && !setup_path_dcid(conn, s.path_index)) {
-                delete_path(conn, s.path_index);
+                ret = delete_path(conn, s.path_index);
+                assert(ret == 0 && "path->dcid is UINT64_MAX and therefore does not trigger an error");
                 s.recalc_send_probe_at = 1;
                 conn->super.stats.num_paths.closed_no_dcid += 1;
                 continue;
@@ -5698,7 +5814,7 @@ size_t quicly_send_stateless_reset(quicly_context_t *ctx, const void *src_cid, v
     return QUICLY_STATELESS_RESET_PACKET_MIN_LEN;
 }
 
-int quicly_send_resumption_token(quicly_conn_t *conn)
+quicly_error_t quicly_send_resumption_token(quicly_conn_t *conn)
 {
     assert(!quicly_is_client(conn));
 
@@ -5709,16 +5825,16 @@ int quicly_send_resumption_token(quicly_conn_t *conn)
     return 0;
 }
 
-static int on_end_closing(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+static quicly_error_t on_end_closing(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     /* we stop accepting frames by the time this ack callback is being registered */
     assert(!acked);
     return 0;
 }
 
-static int enter_close(quicly_conn_t *conn, int local_is_initiating, int wait_draining)
+static quicly_error_t enter_close(quicly_conn_t *conn, int local_is_initiating, int wait_draining)
 {
-    int ret;
+    quicly_error_t ret;
 
     assert(conn->super.state < QUICLY_STATE_CLOSING);
 
@@ -5746,30 +5862,38 @@ static int enter_close(quicly_conn_t *conn, int local_is_initiating, int wait_dr
     return 0;
 }
 
-int initiate_close(quicly_conn_t *conn, int err, uint64_t frame_type, const char *reason_phrase)
+quicly_error_t initiate_close(quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type, const char *reason_phrase)
 {
-    uint16_t quic_error_code;
+    uint64_t quic_error_code;
 
     if (conn->super.state >= QUICLY_STATE_CLOSING)
         return 0;
-
-    if (reason_phrase == NULL)
-        reason_phrase = "";
 
     /* convert error code to QUIC error codes */
     if (err == 0) {
         quic_error_code = 0;
         frame_type = QUICLY_FRAME_TYPE_PADDING;
+    } else if (err == QUICLY_ERROR_STATE_EXHAUSTION) {
+        /* State exhaution is an error induced by the peer, but as there is no specific error code, the generic error code
+         * (PROTOCOL_VIOLATION) is used. The exact cause is communicated using the reason phrase field because it is sometimes
+         * difficult for the peer to understand the problem without; e.g., when an ACK triggering the loss of a RETIRE_CONNECTION_ID
+         * frame leading to the overflow of `quicly_conn_t::egress.retire_cid`. */
+        quic_error_code = QUICLY_ERROR_GET_ERROR_CODE(QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
+        if (reason_phrase == NULL)
+            reason_phrase = "state exhaustion";
     } else if (QUICLY_ERROR_IS_QUIC_TRANSPORT(err)) {
         quic_error_code = QUICLY_ERROR_GET_ERROR_CODE(err);
     } else if (QUICLY_ERROR_IS_QUIC_APPLICATION(err)) {
         quic_error_code = QUICLY_ERROR_GET_ERROR_CODE(err);
         frame_type = UINT64_MAX;
     } else if (PTLS_ERROR_GET_CLASS(err) == PTLS_ERROR_CLASS_SELF_ALERT) {
-        quic_error_code = QUICLY_TRANSPORT_ERROR_TLS_ALERT_BASE + PTLS_ERROR_TO_ALERT(err);
+        quic_error_code = QUICLY_ERROR_GET_ERROR_CODE(QUICLY_TRANSPORT_ERROR_CRYPTO(PTLS_ERROR_TO_ALERT(err)));
     } else {
         quic_error_code = QUICLY_ERROR_GET_ERROR_CODE(QUICLY_TRANSPORT_ERROR_INTERNAL);
     }
+
+    if (reason_phrase == NULL)
+        reason_phrase = "";
 
     conn->egress.connection_close.error_code = quic_error_code;
     conn->egress.connection_close.frame_type = frame_type;
@@ -5777,9 +5901,9 @@ int initiate_close(quicly_conn_t *conn, int err, uint64_t frame_type, const char
     return enter_close(conn, 1, 0);
 }
 
-int quicly_close(quicly_conn_t *conn, int err, const char *reason_phrase)
+quicly_error_t quicly_close(quicly_conn_t *conn, quicly_error_t err, const char *reason_phrase)
 {
-    int ret;
+    quicly_error_t ret;
 
     assert(err == 0 || QUICLY_ERROR_IS_QUIC_APPLICATION(err) || QUICLY_ERROR_IS_CONCEALED(err));
 
@@ -5790,9 +5914,9 @@ int quicly_close(quicly_conn_t *conn, int err, const char *reason_phrase)
     return ret;
 }
 
-int quicly_get_or_open_stream(quicly_conn_t *conn, uint64_t stream_id, quicly_stream_t **stream)
+quicly_error_t quicly_get_or_open_stream(quicly_conn_t *conn, uint64_t stream_id, quicly_stream_t **stream)
 {
-    int ret = 0;
+    quicly_error_t ret = 0;
 
     if ((*stream = quicly_get_stream(conn, stream_id)) != NULL)
         goto Exit;
@@ -5836,11 +5960,11 @@ Exit:
     return ret;
 }
 
-static int handle_crypto_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_crypto_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_stream_frame_t frame;
     quicly_stream_t *stream;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_crypto_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -5849,11 +5973,11 @@ static int handle_crypto_frame(quicly_conn_t *conn, struct st_quicly_handle_payl
     return apply_stream_frame(stream, &frame);
 }
 
-static int handle_stream_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_stream_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_stream_frame_t frame;
     quicly_stream_t *stream;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_stream_frame(state->frame_type, &state->src, state->end, &frame)) != 0)
         return ret;
@@ -5863,11 +5987,11 @@ static int handle_stream_frame(quicly_conn_t *conn, struct st_quicly_handle_payl
     return apply_stream_frame(stream, &frame);
 }
 
-static int handle_reset_stream_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_reset_stream_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_reset_stream_frame_t frame;
     quicly_stream_t *stream;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_reset_stream_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -5886,7 +6010,7 @@ static int handle_reset_stream_frame(quicly_conn_t *conn, struct st_quicly_handl
         if ((ret = quicly_recvstate_reset(&stream->recvstate, frame.final_size, &bytes_missing)) != 0)
             return ret;
         stream->conn->ingress.max_data.bytes_consumed += bytes_missing;
-        int err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
+        quicly_error_t err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
         QUICLY_PROBE(STREAM_ON_RECEIVE_RESET, stream->conn, stream->conn->stash.now, stream, err);
         QUICLY_LOG_CONN(stream_on_receive_reset, stream->conn, {
             PTLS_LOG_ELEMENT_SIGNED(stream_id, stream->stream_id);
@@ -5902,7 +6026,7 @@ static int handle_reset_stream_frame(quicly_conn_t *conn, struct st_quicly_handl
     return 0;
 }
 
-static int handle_ack_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_ack_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_ack_frame_t frame;
     quicly_sentmap_iter_t iter;
@@ -5911,13 +6035,15 @@ static int handle_ack_frame(quicly_conn_t *conn, struct st_quicly_handle_payload
         int64_t sent_at;
     } largest_newly_acked = {UINT64_MAX, INT64_MAX};
     size_t bytes_acked = 0;
-    int includes_ack_eliciting = 0, includes_late_ack = 0, ret;
+    int includes_ack_eliciting = 0, includes_late_ack = 0;
+    quicly_error_t ret;
 
     /* The flow is considered CC-limited if the packet was sent while `inflight >= 1/2 * CNWD` or acked under the same condition.
      * 1/2 of CWND is adopted for fairness with RFC 7661, and also provides correct increase; i.e., if an idle flow goes into
      * CC-limited state for X round-trips then becomes idle again, all packets sent during that X round-trips will be considered as
      * CC-limited. */
-    int cc_limited = !conn->super.ctx->respect_app_limited || conn->egress.loss.sentmap.bytes_in_flight >= conn->egress.cc.cwnd / 2;
+    int cc_limited =
+        conn->super.stats.num_respected_app_limited == 0 || conn->egress.loss.sentmap.bytes_in_flight >= conn->egress.cc.cwnd / 2;
 
     if ((ret = quicly_decode_ack_frame(&state->src, state->end, &frame, state->frame_type == QUICLY_FRAME_TYPE_ACK_ECN)) != 0)
         return ret;
@@ -6095,11 +6221,11 @@ static int handle_ack_frame(quicly_conn_t *conn, struct st_quicly_handle_payload
     return 0;
 }
 
-static int handle_max_stream_data_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_max_stream_data_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_max_stream_data_frame_t frame;
     quicly_stream_t *stream;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_max_stream_data_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6127,10 +6253,10 @@ static int handle_max_stream_data_frame(quicly_conn_t *conn, struct st_quicly_ha
     return 0;
 }
 
-static int handle_data_blocked_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_data_blocked_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_data_blocked_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_data_blocked_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6145,11 +6271,11 @@ static int handle_data_blocked_frame(quicly_conn_t *conn, struct st_quicly_handl
     return 0;
 }
 
-static int handle_stream_data_blocked_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_stream_data_blocked_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_stream_data_blocked_frame_t frame;
     quicly_stream_t *stream;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_stream_data_blocked_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6172,10 +6298,11 @@ static int handle_stream_data_blocked_frame(quicly_conn_t *conn, struct st_quicl
     return 0;
 }
 
-static int handle_streams_blocked_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_streams_blocked_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_streams_blocked_frame_t frame;
-    int uni = state->frame_type == QUICLY_FRAME_TYPE_STREAMS_BLOCKED_UNI, ret;
+    int uni = state->frame_type == QUICLY_FRAME_TYPE_STREAMS_BLOCKED_UNI;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_streams_blocked_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6195,10 +6322,10 @@ static int handle_streams_blocked_frame(quicly_conn_t *conn, struct st_quicly_ha
     return 0;
 }
 
-static int handle_max_streams_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state, int uni)
+static quicly_error_t handle_max_streams_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state, int uni)
 {
     quicly_max_streams_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_max_streams_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6217,20 +6344,20 @@ static int handle_max_streams_frame(quicly_conn_t *conn, struct st_quicly_handle
     return 0;
 }
 
-static int handle_max_streams_bidi_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_max_streams_bidi_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     return handle_max_streams_frame(conn, state, 0);
 }
 
-static int handle_max_streams_uni_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_max_streams_uni_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     return handle_max_streams_frame(conn, state, 1);
 }
 
-static int handle_path_challenge_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_path_challenge_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_path_challenge_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_path_challenge_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6247,10 +6374,10 @@ static int handle_path_challenge_frame(quicly_conn_t *conn, struct st_quicly_han
     return 0;
 }
 
-static int handle_path_response_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_path_response_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_path_challenge_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_path_challenge_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6270,10 +6397,10 @@ static int handle_path_response_frame(quicly_conn_t *conn, struct st_quicly_hand
     return 0;
 }
 
-static int handle_new_token_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_new_token_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_new_token_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if (!quicly_is_client(conn))
         return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
@@ -6286,11 +6413,11 @@ static int handle_new_token_frame(quicly_conn_t *conn, struct st_quicly_handle_p
     return conn->super.ctx->save_resumption_token->cb(conn->super.ctx->save_resumption_token, conn, frame.token);
 }
 
-static int handle_stop_sending_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_stop_sending_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_stop_sending_frame_t frame;
     quicly_stream_t *stream;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_stop_sending_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6305,7 +6432,7 @@ static int handle_stop_sending_frame(quicly_conn_t *conn, struct st_quicly_handl
 
     if (quicly_sendstate_is_open(&stream->sendstate)) {
         /* reset the stream, then notify the application */
-        int err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
+        quicly_error_t err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
         quicly_reset_stream(stream, err);
         QUICLY_PROBE(STREAM_ON_SEND_STOP, stream->conn, stream->conn->stash.now, stream, err);
         QUICLY_LOG_CONN(stream_on_send_stop, stream->conn, {
@@ -6320,10 +6447,10 @@ static int handle_stop_sending_frame(quicly_conn_t *conn, struct st_quicly_handl
     return 0;
 }
 
-static int handle_max_data_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_max_data_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_max_data_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_max_data_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6339,9 +6466,9 @@ static int handle_max_data_frame(quicly_conn_t *conn, struct st_quicly_handle_pa
     return 0;
 }
 
-static int negotiate_using_version(quicly_conn_t *conn, uint32_t version)
+static quicly_error_t negotiate_using_version(quicly_conn_t *conn, uint32_t version)
 {
-    int ret;
+    quicly_error_t ret;
 
     /* set selected version, update transport parameters extension ID */
     conn->super.version = version;
@@ -6359,7 +6486,7 @@ static int negotiate_using_version(quicly_conn_t *conn, uint32_t version)
     return 0;
 }
 
-static int handle_version_negotiation_packet(quicly_conn_t *conn, quicly_decoded_packet_t *packet)
+static quicly_error_t handle_version_negotiation_packet(quicly_conn_t *conn, quicly_decoded_packet_t *packet)
 {
     const uint8_t *src = packet->octets.base + packet->encrypted_off, *end = packet->octets.base + packet->octets.len;
     uint32_t selected_version = 0;
@@ -6494,9 +6621,9 @@ Found_StatelessReset:
     return 1;
 }
 
-int handle_close(quicly_conn_t *conn, int err, uint64_t frame_type, ptls_iovec_t reason_phrase)
+quicly_error_t handle_close(quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type, ptls_iovec_t reason_phrase)
 {
-    int ret;
+    quicly_error_t ret;
 
     if (conn->super.state >= QUICLY_STATE_CLOSING)
         return 0;
@@ -6513,10 +6640,10 @@ int handle_close(quicly_conn_t *conn, int err, uint64_t frame_type, ptls_iovec_t
     return 0;
 }
 
-static int handle_transport_close_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_transport_close_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_transport_close_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_transport_close_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6531,10 +6658,10 @@ static int handle_transport_close_frame(quicly_conn_t *conn, struct st_quicly_ha
     return handle_close(conn, QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(frame.error_code), frame.frame_type, frame.reason_phrase);
 }
 
-static int handle_application_close_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_application_close_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_application_close_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_application_close_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6548,12 +6675,12 @@ static int handle_application_close_frame(quicly_conn_t *conn, struct st_quicly_
     return handle_close(conn, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.error_code), UINT64_MAX, frame.reason_phrase);
 }
 
-static int handle_padding_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_padding_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     return 0;
 }
 
-static int handle_ping_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_ping_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     QUICLY_PROBE(PING_RECEIVE, conn, conn->stash.now);
     QUICLY_LOG_CONN(ping_receive, conn, {});
@@ -6561,10 +6688,10 @@ static int handle_ping_frame(quicly_conn_t *conn, struct st_quicly_handle_payloa
     return 0;
 }
 
-static int handle_new_connection_id_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_new_connection_id_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
-    int ret;
     quicly_new_connection_id_frame_t frame;
+    quicly_error_t ret;
 
     /* TODO: return error when using zero-length CID */
 
@@ -6581,23 +6708,24 @@ static int handle_new_connection_id_frame(quicly_conn_t *conn, struct st_quicly_
         PTLS_LOG_ELEMENT_HEXDUMP(stateless_reset_token, frame.stateless_reset_token, QUICLY_STATELESS_RESET_TOKEN_LEN);
     });
 
-    uint64_t unregistered_seqs[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT];
-    size_t num_unregistered_seqs;
+    size_t orig_num_retired = conn->super.remote.cid_set.retired.count;
     if ((ret = quicly_remote_cid_register(&conn->super.remote.cid_set, frame.sequence, frame.cid.base, frame.cid.len,
-                                          frame.stateless_reset_token, frame.retire_prior_to, unregistered_seqs,
-                                          &num_unregistered_seqs)) != 0)
+                                          frame.stateless_reset_token, frame.retire_prior_to)) != 0)
         return ret;
-
-    for (size_t i = 0; i < num_unregistered_seqs; i++)
-        retire_connection_id(conn, unregistered_seqs[i]);
+    if (orig_num_retired != conn->super.remote.cid_set.retired.count) {
+        for (size_t i = orig_num_retired; i < conn->super.remote.cid_set.retired.count; ++i)
+            dissociate_cid(conn, conn->super.remote.cid_set.retired.cids[i]);
+        conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
+    }
 
     return 0;
 }
 
-static int handle_retire_connection_id_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_retire_connection_id_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
-    int ret, has_pending;
+    int has_pending;
     quicly_retire_connection_id_frame_t frame;
+    quicly_error_t ret;
 
     if ((ret = quicly_decode_retire_connection_id_frame(&state->src, state->end, &frame)) != 0)
         return ret;
@@ -6619,9 +6747,9 @@ static int handle_retire_connection_id_frame(quicly_conn_t *conn, struct st_quic
     return 0;
 }
 
-static int handle_handshake_done_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_handshake_done_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
-    int ret;
+    quicly_error_t ret;
 
     QUICLY_PROBE(HANDSHAKE_DONE_RECEIVE, conn, conn->stash.now);
     QUICLY_LOG_CONN(handshake_done_receive, conn, {});
@@ -6640,10 +6768,10 @@ static int handle_handshake_done_frame(quicly_conn_t *conn, struct st_quicly_han
     return 0;
 }
 
-static int handle_datagram_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_datagram_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_datagram_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     /* check if we advertised support for DATAGRAM frames on this connection */
     if (conn->super.ctx->transport_params.max_datagram_frame_size == 0)
@@ -6661,10 +6789,10 @@ static int handle_datagram_frame(quicly_conn_t *conn, struct st_quicly_handle_pa
     return 0;
 }
 
-static int handle_ack_frequency_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+static quicly_error_t handle_ack_frequency_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
 {
     quicly_ack_frequency_frame_t frame;
-    int ret;
+    quicly_error_t ret;
 
     /* recognize the frame only when the support has been advertised */
     if (conn->super.ctx->transport_params.min_ack_delay_usec == UINT64_MAX)
@@ -6697,14 +6825,15 @@ static int handle_ack_frequency_frame(quicly_conn_t *conn, struct st_quicly_hand
     return 0;
 }
 
-static int handle_payload(quicly_conn_t *conn, size_t epoch, size_t path_index, const uint8_t *_src, size_t _len,
-                          uint64_t *offending_frame_type, int *is_ack_only, int *is_probe_only)
+static quicly_error_t handle_payload(quicly_conn_t *conn, size_t epoch, size_t path_index, const uint8_t *_src, size_t _len,
+                                     uint64_t *offending_frame_type, int *is_ack_only, int *is_probe_only)
 {
     /* clang-format off */
 
     /* `frame_handlers` is an array of frame handlers and the properties of the frames, indexed by the ID of the frame. */
     static const struct st_quicly_frame_handler_t {
-        int (*cb)(quicly_conn_t *, struct st_quicly_handle_payload_state_t *); /* callback function that handles the frame */
+        quicly_error_t (*cb)(quicly_conn_t *, struct st_quicly_handle_payload_state_t *); /* callback function that handles the
+                                                                                           * frame */
         uint8_t permitted_epochs;  /* the epochs the frame can appear, calculated as bitwise-or of `1 << epoch` */
         uint8_t ack_eliciting;     /* boolean indicating if the frame is ack-eliciting */
         uint8_t probing;           /* boolean indicating if the frame is a "probing frame" */
@@ -6788,7 +6917,7 @@ static int handle_payload(quicly_conn_t *conn, size_t epoch, size_t path_index, 
 
     struct st_quicly_handle_payload_state_t state = {.epoch = epoch, .path_index = path_index, .src = _src, .end = _src + _len};
     size_t num_frames_ack_eliciting = 0, num_frames_non_probing = 0;
-    int ret;
+    quicly_error_t ret;
 
     do {
         /* determine the frame type; fast path is available for frame types below 64 */
@@ -6835,7 +6964,7 @@ static int handle_payload(quicly_conn_t *conn, size_t epoch, size_t path_index, 
     return ret;
 }
 
-static int handle_stateless_reset(quicly_conn_t *conn)
+static quicly_error_t handle_stateless_reset(quicly_conn_t *conn)
 {
     QUICLY_PROBE(STATELESS_RESET_RECEIVE, conn, conn->stash.now);
     QUICLY_LOG_CONN(stateless_reset_receive, conn, {});
@@ -6853,9 +6982,10 @@ static int validate_retry_tag(quicly_decoded_packet_t *packet, quicly_cid_t *odc
                              PTLS_AESGCM_TAG_SIZE, 0, pseudo_packet, pseudo_packet_len) == 0;
 }
 
-int quicly_accept(quicly_conn_t **conn, quicly_context_t *ctx, struct sockaddr *dest_addr, struct sockaddr *src_addr,
-                  quicly_decoded_packet_t *packet, quicly_address_token_plaintext_t *address_token,
-                  const quicly_cid_plaintext_t *new_cid, ptls_handshake_properties_t *handshake_properties, void *appdata)
+quicly_error_t quicly_accept(quicly_conn_t **conn, quicly_context_t *ctx, struct sockaddr *dest_addr, struct sockaddr *src_addr,
+                             quicly_decoded_packet_t *packet, quicly_address_token_plaintext_t *address_token,
+                             const quicly_cid_plaintext_t *new_cid, ptls_handshake_properties_t *handshake_properties,
+                             void *appdata)
 {
     const quicly_salt_t *salt;
     struct {
@@ -6864,7 +6994,8 @@ int quicly_accept(quicly_conn_t **conn, quicly_context_t *ctx, struct sockaddr *
     } cipher = {};
     ptls_iovec_t payload;
     uint64_t next_expected_pn, pn, offending_frame_type = QUICLY_FRAME_TYPE_PADDING;
-    int is_ack_only, is_probe_only, ret;
+    int is_ack_only, is_probe_only;
+    quicly_error_t ret;
 
     *conn = NULL;
 
@@ -6940,7 +7071,23 @@ int quicly_accept(quicly_conn_t **conn, quicly_context_t *ctx, struct sockaddr *
                  QUICLY_PROBE_HEXDUMP(packet->cid.dest.encrypted.base, packet->cid.dest.encrypted.len), address_token);
     QUICLY_LOG_CONN(accept, *conn, {
         PTLS_LOG_ELEMENT_HEXDUMP(dcid, packet->cid.dest.encrypted.base, packet->cid.dest.encrypted.len);
-        PTLS_LOG_ELEMENT_PTR(address_token, address_token);
+        if (address_token != NULL) {
+            PTLS_LOG_ELEMENT_UNSIGNED(type, address_token->type);
+            PTLS_LOG_ELEMENT_UNSIGNED(issued_at, address_token->issued_at);
+            PTLS_LOG_ELEMENT_BOOL(address_mismatch, address_token->address_mismatch);
+            switch (address_token->type) {
+            case QUICLY_ADDRESS_TOKEN_TYPE_RETRY:
+                PTLS_LOG_ELEMENT_HEXDUMP(original_dcid, address_token->retry.original_dcid.cid,
+                                         address_token->retry.original_dcid.len);
+                PTLS_LOG_ELEMENT_HEXDUMP(client_cid, address_token->retry.client_cid.cid, address_token->retry.client_cid.len);
+                PTLS_LOG_ELEMENT_HEXDUMP(server_cid, address_token->retry.server_cid.cid, address_token->retry.server_cid.len);
+                break;
+            case QUICLY_ADDRESS_TOKEN_TYPE_RESUMPTION:
+                PTLS_LOG_ELEMENT_UNSIGNED(rate, (*conn)->super.stats.jumpstart.prev_rate);
+                PTLS_LOG_ELEMENT_UNSIGNED(rtt, (*conn)->super.stats.jumpstart.prev_rtt);
+                break;
+            }
+        }
     });
     QUICLY_PROBE(PACKET_RECEIVED, *conn, (*conn)->stash.now, pn, payload.base, payload.len, get_epoch(packet->octets.base[0]));
     QUICLY_LOG_CONN(packet_received, *conn, {
@@ -6981,7 +7128,8 @@ Exit:
     return ret;
 }
 
-int quicly_receive(quicly_conn_t *conn, struct sockaddr *dest_addr, struct sockaddr *src_addr, quicly_decoded_packet_t *packet)
+quicly_error_t quicly_receive(quicly_conn_t *conn, struct sockaddr *dest_addr, struct sockaddr *src_addr,
+                              quicly_decoded_packet_t *packet)
 {
     ptls_cipher_context_t *header_protection;
     struct {
@@ -6992,7 +7140,8 @@ int quicly_receive(quicly_conn_t *conn, struct sockaddr *dest_addr, struct socka
     size_t epoch, path_index;
     ptls_iovec_t payload;
     uint64_t pn, offending_frame_type = QUICLY_FRAME_TYPE_PADDING;
-    int is_ack_only, is_probe_only, ret;
+    int is_ack_only, is_probe_only;
+    quicly_error_t ret;
 
     assert(src_addr->sa_family == AF_INET || src_addr->sa_family == AF_INET6);
 
@@ -7331,14 +7480,14 @@ Exit:
     return ret;
 }
 
-int quicly_open_stream(quicly_conn_t *conn, quicly_stream_t **_stream, int uni)
+quicly_error_t quicly_open_stream(quicly_conn_t *conn, quicly_stream_t **_stream, int uni)
 {
     quicly_stream_t *stream;
     struct st_quicly_conn_streamgroup_state_t *group;
     uint64_t *max_stream_count;
     uint32_t max_stream_data_local;
     uint64_t max_stream_data_remote;
-    int ret;
+    quicly_error_t ret;
 
     /* determine the states */
     if (uni) {
@@ -7381,7 +7530,7 @@ int quicly_open_stream(quicly_conn_t *conn, quicly_stream_t **_stream, int uni)
     return 0;
 }
 
-void quicly_reset_stream(quicly_stream_t *stream, int err)
+void quicly_reset_stream(quicly_stream_t *stream, quicly_error_t err)
 {
     assert(quicly_stream_has_send_side(quicly_is_client(stream->conn), stream->stream_id));
     assert(QUICLY_ERROR_IS_QUIC_APPLICATION(err));
@@ -7400,7 +7549,7 @@ void quicly_reset_stream(quicly_stream_t *stream, int err)
     resched_stream_data(stream);
 }
 
-void quicly_request_stop(quicly_stream_t *stream, int err)
+void quicly_request_stop(quicly_stream_t *stream, quicly_error_t err)
 {
     assert(quicly_stream_has_receive_side(quicly_is_client(stream->conn), stream->stream_id));
     assert(QUICLY_ERROR_IS_QUIC_APPLICATION(err));
@@ -7510,10 +7659,10 @@ void quicly_amend_ptls_context(ptls_context_t *ptls)
         ptls->max_early_data_size = UINT32_MAX;
 }
 
-int quicly_encrypt_address_token(void (*random_bytes)(void *, size_t), ptls_aead_context_t *aead, ptls_buffer_t *buf,
-                                 size_t start_off, const quicly_address_token_plaintext_t *plaintext)
+quicly_error_t quicly_encrypt_address_token(void (*random_bytes)(void *, size_t), ptls_aead_context_t *aead, ptls_buffer_t *buf,
+                                            size_t start_off, const quicly_address_token_plaintext_t *plaintext)
 {
-    int ret;
+    quicly_error_t ret;
 
     /* type and IV */
     if ((ret = ptls_buffer_reserve(buf, 1 + aead->algo->iv_size)) != 0)
@@ -7576,8 +7725,8 @@ Exit:
     return ret;
 }
 
-int quicly_decrypt_address_token(ptls_aead_context_t *aead, quicly_address_token_plaintext_t *plaintext, const void *_token,
-                                 size_t len, size_t prefix_len, const char **err_desc)
+quicly_error_t quicly_decrypt_address_token(ptls_aead_context_t *aead, quicly_address_token_plaintext_t *plaintext,
+                                            const void *_token, size_t len, size_t prefix_len, const char **err_desc)
 {
     const uint8_t *const token = _token;
     uint8_t ptbuf[QUICLY_MIN_CLIENT_INITIAL_SIZE];
@@ -7609,7 +7758,7 @@ int quicly_decrypt_address_token(ptls_aead_context_t *aead, quicly_address_token
     }
 
     /* `goto Exit` can only happen below this line, and that is guaranteed by declaring `ret` here */
-    int ret;
+    quicly_error_t ret;
 
     /* decrypt */
     ptls_aead_set_iv(aead, token + prefix_len + 1);
@@ -7735,7 +7884,7 @@ Exit:
     return ret;
 }
 
-void quicly_stream_noop_on_destroy(quicly_stream_t *stream, int err)
+void quicly_stream_noop_on_destroy(quicly_stream_t *stream, quicly_error_t err)
 {
 }
 
@@ -7747,7 +7896,7 @@ void quicly_stream_noop_on_send_emit(quicly_stream_t *stream, size_t off, void *
 {
 }
 
-void quicly_stream_noop_on_send_stop(quicly_stream_t *stream, int err)
+void quicly_stream_noop_on_send_stop(quicly_stream_t *stream, quicly_error_t err)
 {
 }
 
@@ -7755,7 +7904,7 @@ void quicly_stream_noop_on_receive(quicly_stream_t *stream, size_t off, const vo
 {
 }
 
-void quicly_stream_noop_on_receive_reset(quicly_stream_t *stream, int err)
+void quicly_stream_noop_on_receive_reset(quicly_stream_t *stream, quicly_error_t err)
 {
 }
 

@@ -117,6 +117,13 @@ extern "C" {
 #define PTLS_BLOWFISH_KEY_SIZE 16
 #define PTLS_BLOWFISH_BLOCK_SIZE 8
 
+#define PTLS_QUICLB_KEY_SIZE 16 /* same as the underlying aes128ecb */
+#define PTLS_QUICLB_MIN_BLOCK_SIZE 7
+#define PTLS_QUICLB_MAX_BLOCK_SIZE 19 /* inclusive */
+#define PTLS_QUICLB_DEFAULT_BLOCK_SIZE                                                                                             \
+    8 /* when the quiclb cipher is used, the blob passed to ptls_cipher_encrypt can be anything between the min and max above;     \
+         however, 8 is the default set in `ptls_cipher_algorithm_t::block_size` */
+
 #define PTLS_SHA256_BLOCK_SIZE 64
 #define PTLS_SHA256_DIGEST_SIZE 32
 
@@ -171,8 +178,18 @@ extern "C" {
 #define PTLS_GROUP_NAME_X25519 "x25519"
 #define PTLS_GROUP_X448 30
 #define PTLS_GROUP_NAME_X448 "x448"
+#define PTLS_GROUP_SECP256R1MLKEM768 4587
+#define PTLS_GROUP_NAME_SECP256R1MLKEM768 "SecP256r1MLKEM768"
 #define PTLS_GROUP_X25519MLKEM768 4588
 #define PTLS_GROUP_NAME_X25519MLKEM768 "X25519MLKEM768"
+#define PTLS_GROUP_SECP384R1MLKEM1024 4589
+#define PTLS_GROUP_NAME_SECP384R1MLKEM1024 "SecP384r1MLKEM1024"
+#define PTLS_GROUP_MLKEM512 512
+#define PTLS_GROUP_NAME_MLKEM512 "MLKEM512"
+#define PTLS_GROUP_MLKEM768 513
+#define PTLS_GROUP_NAME_MLKEM768 "MLKEM768"
+#define PTLS_GROUP_MLKEM1024 514
+#define PTLS_GROUP_NAME_MLKEM1024 "MLKEM1024"
 
 /* signature algorithms */
 #define PTLS_SIGNATURE_RSA_PKCS1_SHA1 0x0201
