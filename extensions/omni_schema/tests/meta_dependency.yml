@@ -95,11 +95,12 @@ tests:
   results:
   - result: true
 
-- name: operators have correct type namespaces
+- name: operators with cross-schema types have correct type namespaces
   query: |
-    select count(*) as operator_count
-    from omni_schema.dependency 
+    select id::text as operator_id
+    from omni_schema.dependency
     where omni_types.variant(id) = 'omni_schema.operator_id'::regtype
-      and id::text = 'operator_id((omni_schema,=,omni_schema,object_id,omni_schema,object_id))'
+      and id::text like 'operator_id((omni_schema,~~~,%'
+    limit 1
   results:
-  - operator_count: 8
+  - operator_id: "operator_id((omni_schema,~~~,omni_schema,object_id,pg_catalog,text))"
